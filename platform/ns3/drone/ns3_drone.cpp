@@ -11,14 +11,12 @@ Ns3Drone::Ns3Drone(
 ) : 
   m_id(id),
   m_node(node),
-  m_comm(std::make_unique<sim::Ns3SocketTransport>(node), id),
+  m_comm(std::make_unique<sim::UwbTransport>(node, id), id),
   m_controller(id, k_att, k_rep, d_safe, v_max, drone_weight_kg)
 {
   if (!m_node) {
     return;
   }
-
-  m_transport_ip = sim::RadioEnvironment::Get().Install(m_node).ip;
 
   auto mobility = m_node->GetObject<::ns3::ConstantPositionMobilityModel>();
   if (!mobility) {
@@ -27,34 +25,34 @@ Ns3Drone::Ns3Drone(
   }
 
   m_custom_mobility = std::make_unique<CustomMobility>(mobility);
-  m_position = std::make_unique<Ns3Position>(m_custom_mobility.get());
   m_velocity_actuator = std::make_unique<Ns3VelocityActuator>(m_custom_mobility.get());
 
   m_comm.setReceiveHandler([this](const ::Packet& pkt) { dispatchPacket(pkt); });
 
   m_flood_manager = std::make_unique<FloodManager>(m_id, m_comm, [this]() { return isBaseReachable(); });
   m_neighbor_manager = std::make_unique<NeighborManager>(&m_comm);
+  m_uwb_ranging_manager = std::make_unique<UwbRangingManager>(
+    []() { return ::ns3::Simulator::Now().GetSeconds(); });
+  m_uwb_position = std::make_unique<UwbPosition>(m_uwb_ranging_manager.get());
 
   m_dispatcher.setFloodManager(m_flood_manager.get());
   m_dispatcher.setNeighborManager(m_neighbor_manager.get());
+  m_dispatcher.setUwbRangingManager(m_uwb_ranging_manager.get());
   m_dispatcher.setFallbackHandler([this](const ::Packet& pkt) { handleCorePacket(pkt); });
 
   m_last_ack_rx_s = ::ns3::Simulator::Now().GetSeconds();
 
   // Stagger periodic behavior to avoid all drones transmitting at the same instant.
-  // This reduces Wi-Fi contention and makes ACK timeouts correlate with real disconnection.
   m_tick_phase_s = 0.01 * static_cast<double>(m_id);
 }
 
-void Ns3Drone::setBaseStation(uint8_t base_id, ::ns3::Ipv4Address base_ip, PositionInterface* base_position) {
+void Ns3Drone::setBaseStation(uint8_t base_id) {
   m_base_id = base_id;
-  m_base_ip = base_ip;
-  m_base_position = base_position;
   m_has_base = true;
 
   m_last_ack_rx_s = ::ns3::Simulator::Now().GetSeconds();
 
-  m_comm.registerPeer(base_id, base_ip.Get());
+  m_comm.registerPeer(base_id, 0);  // address unused with UWB transport
   if (m_flood_manager) {
     m_flood_manager->setBaseId(base_id);
   }
@@ -69,7 +67,7 @@ void Ns3Drone::setRepositionLogger(const std::shared_ptr<std::ofstream>& csv) {
 }
 
 void Ns3Drone::startMission() {
-  if (!m_flood_manager || !m_velocity_actuator || !m_neighbor_manager || !m_position) {
+  if (!m_flood_manager || !m_velocity_actuator || !m_neighbor_manager || !m_uwb_position) {
     return;
   }
 
@@ -96,9 +94,9 @@ void Ns3Drone::onTick() {
   // Post-mission debug: log how drones reposition 
   if (m_mission_start_s >= 0.0) {
     if (m_last_mission_log_s < 0.0 || (now_s - m_last_mission_log_s) >= m_mission_log_dt_s) {
-      if (m_position) {
-        m_position->retrieveCurrentPosition();
-        const auto coords = m_position->getCoordinates();
+      if (m_uwb_position) {
+        m_uwb_position->retrieveCurrentPosition();
+        const auto coords = m_uwb_position->getCoordinates();
         const uint8_t hops = m_flood_manager ? m_flood_manager->getHopsFromBase() : UINT8_MAX;
         const size_t n_neighbors = m_neighbor_manager ? m_neighbor_manager->getNeighbors().size() : 0;
         std::cout << "[Reposition] t=" << now_s << "delta_t" << (now_s - m_last_mission_log_s) << "s drone=" << static_cast<int>(m_id)
@@ -134,12 +132,13 @@ void Ns3Drone::onTick() {
   // Drive motion in lockstep with simulation time.
   // - If mission is active: one potential-field iteration per tick.
   // - If mission is off: apply a default "idle" velocity so drones move and can leave coverage.
-  if (m_flood_manager && m_velocity_actuator && m_neighbor_manager && m_position) {
+  if (m_flood_manager && m_velocity_actuator && m_neighbor_manager && m_uwb_position) {
+    m_uwb_position->retrieveCurrentPosition();
     m_controller.step(
-      m_flood_manager.get(), 
-      m_velocity_actuator.get(), 
-      m_neighbor_manager.get(), 
-      m_position.get()
+      m_flood_manager.get(),
+      m_velocity_actuator.get(),
+      m_neighbor_manager.get(),
+      m_uwb_position.get()
     );
   }
 
@@ -180,7 +179,12 @@ void Ns3Drone::handleCorePacket(const ::Packet& pkt) {
         return;
       }
       if (ack.drone_id != m_id) {
-        // Send in broadcast to the rest of the swarm.
+        // Only relay unicast ACKs from base, not re-broadcasts from other drones.
+        // Without this check, broadcast ACKs create an infinite relay loop.
+        if (pkt.dst == BROADCAST_ID) {
+          return;
+        }
+        // Re-broadcast to swarm so the lost drone can receive it.
         ::Packet relay_pkt;
         relay_pkt.type = ::PacketType::CORE;
         relay_pkt.src = pkt.src;  // keep original sender
@@ -243,9 +247,9 @@ void Ns3Drone::handleCorePacket(const ::Packet& pkt) {
       }
 
       m_last_help_proxy_rx_s = ::ns3::Simulator::Now().GetSeconds();
-      if (m_position) {
-        m_position->retrieveCurrentPosition();
-        const auto coords = m_position->getCoordinates();
+      if (m_uwb_position) {
+        m_uwb_position->retrieveCurrentPosition();
+        const auto coords = m_uwb_position->getCoordinates();
         std::cout << "[HELP_PROXY RX] t=" << m_last_help_proxy_rx_s << "s drone=" << static_cast<int>(m_id)
                   << " requester=" << static_cast<int>(msg.requester_id)
                   << " pos=(" << (coords.size() > 0 ? coords[0] : 0.0)
@@ -299,7 +303,7 @@ void Ns3Drone::handleCorePacket(const ::Packet& pkt) {
 }
 
 void Ns3Drone::sendPositionUpdate() {
-  if (!m_position || !m_has_base) {
+  if (!m_uwb_position || !m_has_base) {
     return;
   }
 
@@ -308,8 +312,8 @@ void Ns3Drone::sendPositionUpdate() {
     return;
   }
 
-  m_position->retrieveCurrentPosition();
-  const auto coords = m_position->getCoordinates();
+  m_uwb_position->retrieveCurrentPosition();
+  const auto coords = m_uwb_position->getCoordinates();
 
   // If help proxy was sent, send position updates via broadcast to inform helpers.
   // Otherwise, unicast to base station.
@@ -337,9 +341,9 @@ void Ns3Drone::sendPositionUpdate() {
 void Ns3Drone::sendHelpProxy() {
   m_last_help_proxy_tx_s = ::ns3::Simulator::Now().GetSeconds();
 
-  if (m_position) {
-    m_position->retrieveCurrentPosition();
-    const auto coords = m_position->getCoordinates();
+  if (m_uwb_position) {
+    m_uwb_position->retrieveCurrentPosition();
+    const auto coords = m_uwb_position->getCoordinates();
     std::cout << "[HELP_PROXY TX] t=" << m_last_help_proxy_tx_s << "s drone=" << static_cast<int>(m_id)
               << " reason=ACK_TIMEOUT"
               << " last_ack=" << m_last_ack_rx_s << "s"

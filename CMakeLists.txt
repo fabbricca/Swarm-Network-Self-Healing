@@ -18,8 +18,10 @@ add_executable(swarm_demo_sim1
 	platform/ns3/custom_mobility/custom_mobility.cpp
 	platform/ns3/position/ns3_position.cpp
 	platform/ns3/velocity_actuator/ns3_velocity_actuator.cpp
-	platform/ns3/transport/ns3_socket_transport.cpp
-	platform/ns3/radio_environment/radio_environment.cpp
+	modules/uwb_ranging/uwb_ranging_manager.cpp
+	platform/ns3/uwb_anchor/ns3_uwb_anchor.cpp
+	platform/ns3/uwb_channel/uwb_channel.cpp
+	platform/ns3/uwb_transport/uwb_transport.cpp
 )
 
 add_executable(controller_tuner
@@ -39,11 +41,7 @@ if(ns3_FOUND)
 		target_link_libraries(swarm_demo_sim1 PRIVATE
 			ns3::core
 			ns3::network
-			ns3::internet
-			ns3::wifi
 			ns3::mobility
-			ns3::propagation
-			ns3::traffic-control
 			ns3::netanim
 		)
 else()

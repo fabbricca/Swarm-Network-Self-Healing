@@ -1,42 +1,29 @@
 #include "platform/ns3/base_station/ns3_base_station.h"
 
 Ns3BaseStation::Ns3BaseStation(
-  uint8_t id, 
+  uint8_t id,
   ::ns3::Ptr<::ns3::Node> node
-) : 
-  m_id(id),
-  m_node(node),
-  m_comm(std::make_unique<sim::Ns3SocketTransport>(node), id) 
+) :
+  Ns3UwbAnchor(id, node)
 {
-  if (!m_node) {
-    return;
-  }
-
-  m_transport_ip = sim::RadioEnvironment::Get().Install(m_node).ip;
-
-  auto mobility = m_node->GetObject<::ns3::ConstantPositionMobilityModel>();
-  if (!mobility) {
-    mobility = ::ns3::CreateObject<::ns3::ConstantPositionMobilityModel>();
-    m_node->AggregateObject(mobility);
-  }
-
-  m_custom_mobility = std::make_unique<CustomMobility>(mobility);
-  m_position = std::make_unique<Ns3Position>(m_custom_mobility.get());
-
   m_comm.setReceiveHandler([this](const ::Packet& pkt) { dispatchPacket(pkt); });
   m_dispatcher.setFallbackHandler([this](const ::Packet& pkt) { handleCorePacket(pkt); });
 }
 
 void Ns3BaseStation::start() {
+  // Start beacon broadcasting (inherited).
+  Ns3UwbAnchor::start();
+
+  // Start flood triggering.
   double initial_delay_s = 0.1;
   ::ns3::Simulator::Schedule(::ns3::Seconds(initial_delay_s), ::ns3::MakeCallback(&Ns3BaseStation::onTick, this));
 }
 
 void Ns3BaseStation::onTick() {
-  if (!m_drone_ips.empty()) {
+  if (!m_drone_ids.empty()) {
     // Choose a stable initiator: the lowest registered drone id.
     uint8_t initiator = 0;
-    for (const auto& kv : m_drone_ips) {
+    for (const auto& kv : m_drone_ids) {
       initiator = (initiator == 0) ? kv.first : static_cast<uint8_t>(std::min<int>(initiator, kv.first));
     }
     if (initiator != 0) {
@@ -47,19 +34,9 @@ void Ns3BaseStation::onTick() {
   ::ns3::Simulator::Schedule(::ns3::Seconds(m_tick_dt_s), ::ns3::MakeCallback(&Ns3BaseStation::onTick, this));
 }
 
-void Ns3BaseStation::setPosition(double x, double y, double z) {
-  if (!m_custom_mobility) {
-    return;
-  }
-  m_custom_mobility->setPosition(x, y, z);
-  if (m_position) {
-    m_position->retrieveCurrentPosition();
-  }
-}
-
-void Ns3BaseStation::registerDrone(uint8_t id, ::ns3::Ipv4Address ip) {
-  m_drone_ips[id] = ip;
-  m_comm.registerPeer(id, ip.Get());
+void Ns3BaseStation::registerDrone(uint8_t id) {
+  m_drone_ids[id] = true;
+  m_comm.registerPeer(id, 0);  // address unused with UWB transport
 }
 
 void Ns3BaseStation::requestFlood(uint16_t flood_id, uint8_t initiator_drone_id) {
@@ -73,7 +50,6 @@ void Ns3BaseStation::requestFlood(uint16_t flood_id, uint8_t initiator_drone_id)
   out.payload.resize(sizeof(msg));
   std::memcpy(out.payload.data(), &msg, sizeof(msg));
 
-  // Base station never broadcasts.
   m_comm.send(out);
 }
 
@@ -118,7 +94,6 @@ void Ns3BaseStation::handlePositionUpdate(const PositionUpdateMsg& msg, uint8_t 
     return;
   }
 
-  // Track last seen position.
   m_last_position[msg.drone_id] = msg;
 
   sendPositionAck(msg.drone_id, msg.seq, relay_src);
@@ -146,6 +121,5 @@ void Ns3BaseStation::sendPositionAck(uint8_t drone_id, uint16_t seq, uint8_t rel
   out.payload.resize(sizeof(ack));
   std::memcpy(out.payload.data(), &ack, sizeof(ack));
 
-  // Unicast only.
   m_comm.send(out);
 }

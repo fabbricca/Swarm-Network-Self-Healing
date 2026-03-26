@@ -13,19 +13,18 @@
 #include "modules/dispatch/dispatch_manager.h"
 #include "modules/flood/flood_manager.h"
 #include "modules/neighbor/neighbor_manager.h"
+#include "modules/uwb_ranging/uwb_ranging_manager.h"
+#include "modules/uwb_ranging/uwb_position.h"
 
 #include "common/messages.h"
 #include "common/packet.h"
 
 #include "ns3/core-module.h"
 #include "ns3/constant-position-mobility-model.h"
-#include "ns3/internet-module.h"
 
 #include "platform/ns3/custom_mobility/custom_mobility.h"
-#include "platform/ns3/position/ns3_position.h"
-#include "platform/ns3/transport/ns3_socket_transport.h"
 #include "platform/ns3/velocity_actuator/ns3_velocity_actuator.h"
-#include "platform/ns3/radio_environment/radio_environment.h"
+#include "platform/ns3/uwb_transport/uwb_transport.h"
 
 // NS-3 bound drone node logic.
 // - While not in mission: periodically unicast PositionUpdateMsg to base and wait for PositionAckMsg.
@@ -44,11 +43,10 @@ class Ns3Drone {
   );
 
   uint8_t id() const { return m_id; }
-  ::ns3::Ipv4Address ip() const { return m_transport_ip; }
 
-  PositionInterface* position() const { return m_position.get(); }
+  PositionInterface* position() const { return m_uwb_position.get(); }
 
-  void setBaseStation(uint8_t base_id, ::ns3::Ipv4Address base_ip, PositionInterface* base_position = nullptr);
+  void setBaseStation(uint8_t base_id);
 
   void startMission();
   void stopMission();
@@ -70,21 +68,18 @@ class Ns3Drone {
   uint8_t m_id;
   ::ns3::Ptr<::ns3::Node> m_node;
 
-  ::ns3::Ipv4Address m_transport_ip;
-
   std::unique_ptr<CustomMobility> m_custom_mobility;
-  std::unique_ptr<Ns3Position> m_position;
   std::unique_ptr<Ns3VelocityActuator> m_velocity_actuator;
 
   uint8_t m_base_id = 0;
-  ::ns3::Ipv4Address m_base_ip;
-  PositionInterface* m_base_position = nullptr;
   bool m_has_base = false;
 
   CommunicationManager m_comm;
 
   std::unique_ptr<FloodManager> m_flood_manager;
   std::unique_ptr<NeighborManager> m_neighbor_manager;
+  std::unique_ptr<UwbRangingManager> m_uwb_ranging_manager;
+  std::unique_ptr<UwbPosition> m_uwb_position;
   DispatchManager m_dispatcher;
 
   Controller m_controller;
@@ -111,7 +106,7 @@ class Ns3Drone {
   double m_ack_timeout_s = 1.5;
   double m_last_ack_rx_s = 0.0;
   bool m_waiting_ack = false;
-  
+
   uint16_t m_pos_seq = 0;
   uint16_t m_last_acked_seq = 0;
   double m_last_pos_send_s = 0.0;

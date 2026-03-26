@@ -12,6 +12,7 @@ enum class PacketType : uint8_t {
   CORE = 1,
   FLOOD = 2,
   NEIGHBOR = 3,
+  UWB_BEACON = 4,
 };
 
 struct Packet {

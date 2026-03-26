@@ -43,8 +43,20 @@ struct HelpProxyMsg {
     uint8_t base_id;
 };
 
+// UWB beacon broadcast by anchors at a fixed rate.
+// Drones use the timestamp + known propagation speed to compute
+// ToF-based range for trilateration.
+struct UwbBeaconMsg {
+    uint8_t anchor_id;
+    double  tx_timestamp_s;  // Simulation time at transmission
+    double  x;               // Anchor position (known, fixed)
+    double  y;
+    double  z;
+};
+
 #pragma pack(pop)
 
 static_assert(sizeof(HelpProxyMsg) == 3, "HelpProxyMsg must be packed");
 static_assert(sizeof(PositionUpdateMsg) == 17, "PositionUpdateMsg must be packed");
 static_assert(sizeof(PositionAckMsg) == 30, "PositionAckMsg must be packed");
+static_assert(sizeof(UwbBeaconMsg) == 33, "UwbBeaconMsg must be packed");

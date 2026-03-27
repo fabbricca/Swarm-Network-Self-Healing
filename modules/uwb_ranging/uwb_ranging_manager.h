@@ -20,7 +20,8 @@ class UwbRangingManager : public UwbRangingManagerInterface {
   // get_time_s: returns current simulation time in seconds (injected to stay platform-agnostic).
   // speed_of_light_mps: must match UwbChannelConfig::speedOfLightMps.
   UwbRangingManager(std::function<double()> get_time_s,
-                    double speed_of_light_mps = 299792458.0);
+                    double speed_of_light_mps = 299792458.0,
+                    double noise_std_dev_m = 0.0);
 
   void onPacketReceived(const ::Packet& pkt) override;
 
@@ -45,6 +46,7 @@ class UwbRangingManager : public UwbRangingManagerInterface {
 
   std::function<double()> m_get_time_s;
   double m_speed_of_light_mps;
+  double m_noise_std_dev_m;
   double m_stale_threshold_s = 0.5;  // drop anchors not heard for this long
 
   // Latest range measurement per anchor (overwritten each beacon).

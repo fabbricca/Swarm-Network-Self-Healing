@@ -7,7 +7,8 @@ Ns3Drone::Ns3Drone(
   float k_rep,
   float d_safe,
   float v_max,
-  float drone_weight_kg
+  float drone_weight_kg,
+  double uwb_noise_std_dev_m
 ) : 
   m_id(id),
   m_node(node),
@@ -32,7 +33,8 @@ Ns3Drone::Ns3Drone(
   m_flood_manager = std::make_unique<FloodManager>(m_id, m_comm, [this]() { return isBaseReachable(); });
   m_neighbor_manager = std::make_unique<NeighborManager>(&m_comm);
   m_uwb_ranging_manager = std::make_unique<UwbRangingManager>(
-    []() { return ::ns3::Simulator::Now().GetSeconds(); });
+    []() { return ::ns3::Simulator::Now().GetSeconds(); },
+    299792458.0, uwb_noise_std_dev_m);
   m_uwb_position = std::make_unique<UwbPosition>(m_uwb_ranging_manager.get());
 
   m_dispatcher.setFloodManager(m_flood_manager.get());

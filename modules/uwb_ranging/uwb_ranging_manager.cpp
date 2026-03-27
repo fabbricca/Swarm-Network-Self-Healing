@@ -2,11 +2,14 @@
 
 #include <cmath>
 #include <cstring>
+#include <random>
 
 UwbRangingManager::UwbRangingManager(std::function<double()> get_time_s,
-                                     double speed_of_light_mps)
+                                     double speed_of_light_mps,
+                                     double noise_std_dev_m)
     : m_get_time_s(std::move(get_time_s)),
-      m_speed_of_light_mps(speed_of_light_mps) {}
+      m_speed_of_light_mps(speed_of_light_mps),
+      m_noise_std_dev_m(noise_std_dev_m) {}
 
 void UwbRangingManager::onPacketReceived(const ::Packet& pkt) {
   if (pkt.type != ::PacketType::UWB_BEACON) {
@@ -30,6 +33,15 @@ void UwbRangingManager::onPacketReceived(const ::Packet& pkt) {
   }
 
   double range_m = tof_s * m_speed_of_light_mps;
+
+  if (m_noise_std_dev_m > 0.0) {
+    // We use a local thread_local static generator to be deterministic yet distinct 
+    // enough per run if needed, but for identical simple runs we can just seed it.
+    // Given ns-3 is single-threaded mostly, static is fine.
+    static std::mt19937 gen(12345);
+    std::normal_distribution<double> noise_dist(0.0, m_noise_std_dev_m);
+    range_m += noise_dist(gen);
+  }
 
   AnchorMeasurement meas;
   meas.anchor_id = beacon.anchor_id;

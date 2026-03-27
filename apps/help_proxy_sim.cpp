@@ -47,6 +47,7 @@ int main(int argc, char* argv[]) {
   double dSafe = 2.0;
   double vMax = 1.0;
   double droneWeightKg = 0.029;
+  double uwbNoiseStdDev = 0.0;
   std::string csvOut = "";
   std::string animOut = "/output/drone-simulation.xml";
 
@@ -59,6 +60,7 @@ int main(int argc, char* argv[]) {
   cmd.AddValue("dSafe", "Controller safety distance", dSafe);
   cmd.AddValue("vMax", "Controller max velocity", vMax);
   cmd.AddValue("droneWeightKg", "Controller drone weight (kg)", droneWeightKg);
+  cmd.AddValue("uwbNoiseStdDev", "UWB LOS noise std dev in meters", uwbNoiseStdDev);
   cmd.AddValue("csvOut", "CSV path for reposition logs (empty disables)", csvOut);
   cmd.AddValue("animOut", "NetAnim XML output path (empty disables)", animOut);
   cmd.Parse(argc, argv);

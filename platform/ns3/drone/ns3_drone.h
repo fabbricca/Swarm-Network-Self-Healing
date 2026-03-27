@@ -39,7 +39,8 @@ class Ns3Drone {
     float k_rep = 5.0f,
     float d_safe = 1.0f,
     float v_max = 2.5f,
-    float drone_weight_kg = 0.029f
+    float drone_weight_kg = 0.029f,
+    double uwb_noise_std_dev_m = 0.0
   );
 
   uint8_t id() const { return m_id; }

@@ -69,14 +69,14 @@ int main(int argc, char* argv[]) {
   uwbCfg.maxRangeMeters = maxRangeMeters;
   sim::UwbChannel::Get().Configure(uwbCfg);
 
-  constexpr uint32_t NUM_DRONES = 3;
+  constexpr uint32_t NUM_DRONES = 4;
   constexpr uint32_t NUM_ANCHORS = 5;  // standalone UWB anchors (base is also an anchor)
 
   NodeContainer nodes;
   nodes.Create(1 + NUM_DRONES + NUM_ANCHORS);
   // node 0: base station (also UWB anchor)
-  // node 1..3: drones
-  // node 4..8: standalone UWB anchors
+  // node 1..4: drones
+  // node 5..9: standalone UWB anchors
 
   // Place drone 2 initially outside base coverage so it will timeout and emit HELP_PROXY.
   // Keep it within range of at least one other drone (drone 3) so the HELP_PROXY can be received,
@@ -85,14 +85,15 @@ int main(int argc, char* argv[]) {
   EnsureMobility(nodes.Get(1), Vector(40.0, 15.0, 0.0));
   EnsureMobility(nodes.Get(2), Vector(70.0, 10.0, 0.0));
   EnsureMobility(nodes.Get(3), Vector(30.0, 25.0, 0.0));
+  EnsureMobility(nodes.Get(4), Vector(25.0, 10.0, 0.0));
 
   // Standalone UWB anchors placed so that every drone can hear at least 3 anchors
   // across the full operational area (including negative-Y where helpers reposition).
-  EnsureMobility(nodes.Get(4), Vector(40.0, -10.0, 0.0));
-  EnsureMobility(nodes.Get(5), Vector(40.0, 30.0, 0.0));
-  EnsureMobility(nodes.Get(6), Vector(70.0, 10.0, 0.0));
-  EnsureMobility(nodes.Get(7), Vector(0.0, -30.0, 0.0));
-  EnsureMobility(nodes.Get(8), Vector(-20.0, 10.0, 0.0));
+  EnsureMobility(nodes.Get(5), Vector(40.0, -10.0, 0.0));
+  EnsureMobility(nodes.Get(6), Vector(40.0, 30.0, 0.0));
+  EnsureMobility(nodes.Get(7), Vector(70.0, 10.0, 0.0));
+  EnsureMobility(nodes.Get(8), Vector(0.0, -30.0, 0.0));
+  EnsureMobility(nodes.Get(9), Vector(-20.0, 10.0, 0.0));
 
   Ns3BaseStation base(0, nodes.Get(0));
   base.setPosition(0.0, 0.0, 0.0);
@@ -108,13 +109,13 @@ int main(int argc, char* argv[]) {
     {-20.0, 10.0, 0.0},
   };
   for (uint32_t i = 0; i < NUM_ANCHORS; ++i) {
-    uint8_t anchor_id = static_cast<uint8_t>(NUM_DRONES + 1 + i);  // IDs 4, 5, 6
+    uint8_t anchor_id = static_cast<uint8_t>(NUM_DRONES + 1 + i);  // IDs 5, 6, 7, 8, 9
     anchors.push_back(std::make_unique<Ns3UwbAnchor>(anchor_id, nodes.Get(NUM_DRONES + 1 + i)));
     anchors.back()->setPosition(anchorPositions[i].x, anchorPositions[i].y, anchorPositions[i].z);
   }
 
   std::vector<std::unique_ptr<Ns3Drone>> drones;
-  drones.reserve(3);
+  drones.reserve(NUM_DRONES);
 
   std::shared_ptr<std::ofstream> csv;
   if (!csvOut.empty()) {
@@ -127,7 +128,7 @@ int main(int argc, char* argv[]) {
     }
   }
 
-  for (uint32_t i = 0; i < 3; ++i) {
+  for (uint32_t i = 0; i < NUM_DRONES; ++i) {
     drones.push_back(std::make_unique<Ns3Drone>(
       static_cast<uint8_t>(i + 1),
       nodes.Get(i + 1),
@@ -135,7 +136,8 @@ int main(int argc, char* argv[]) {
       static_cast<float>(kRep),
       static_cast<float>(dSafe),
       static_cast<float>(vMax),
-      static_cast<float>(droneWeightKg)
+      static_cast<float>(droneWeightKg),
+      uwbNoiseStdDev
     ));
     if (csv) {
       drones.back()->setRepositionLogger(csv);
@@ -143,7 +145,7 @@ int main(int argc, char* argv[]) {
   }
 
   // Register peers (no mission forcing here; just wiring IDs).
-  for (uint32_t i = 0; i < 3; ++i) {
+  for (uint32_t i = 0; i < NUM_DRONES; ++i) {
     drones[i]->setBaseStation(base.id());
     base.registerDrone(drones[i]->id());
   }

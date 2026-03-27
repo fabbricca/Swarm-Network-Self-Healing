@@ -33,12 +33,23 @@ void EnsureMobility(Ptr<Node> node, const Vector& pos) {
 int main(int argc, char* argv[]) {
   Time::SetResolution(Time::NS);
 
-  // Requirements:
-  // - 1 base station + 3 drones
-  // - base station coverage range: 50m
-  // - drones move by their own behavior (idle velocity) until one leaves coverage
-  // - leaving coverage -> missing POS_ACK -> drone sends HELP_PROXY
-  // - HELP_PROXY triggers mission_active + repositioning behavior inside drones
+  // Self-healing protocol — automatically handles two multi-drone failure scenarios:
+  //
+  // Scenario 1 — multiple outside drones, ALL reachable by at least one in-coverage drone:
+  //   Each in-coverage drone is attracted (spring-damper) to all outside drones and to
+  //   the base, converging toward the centroid midpoint. Repulsion spreads helpers to
+  //   cover all outside nodes.
+  //
+  // Scenario 2 — chain: only SOME outside drones can reach in-coverage drones directly:
+  //   The reachable outside drones relay HELP_PROXY upstream so in-coverage drones
+  //   discover the full chain. In-coverage drones reposition to serve the reachable
+  //   outside node; that node passively relays (POS_UPDATE + ACK) for the further node
+  //   via multi-hop deduped broadcast relay. Only in-coverage drones (mission_active=true)
+  //   reposition; outside drones stay put and act as passive relay chain nodes.
+  //
+  // The simulation below demonstrates scenario 2 by default:
+  //   Drone 2 (70,10): outside base coverage, reachable by in-coverage Drone 1 and Drone 3.
+  //   Drone 4 (90,20): outside base coverage, only reachable via Drone 2 (not Drone 1/3).
 
   double maxRangeMeters = 50.0;
   double simSeconds = 300.0;
@@ -70,7 +81,7 @@ int main(int argc, char* argv[]) {
   sim::UwbChannel::Get().Configure(uwbCfg);
 
   constexpr uint32_t NUM_DRONES = 4;
-  constexpr uint32_t NUM_ANCHORS = 5;  // standalone UWB anchors (base is also an anchor)
+  constexpr uint32_t NUM_ANCHORS = 7;  // standalone UWB anchors (base is also an anchor)
 
   NodeContainer nodes;
   nodes.Create(1 + NUM_DRONES + NUM_ANCHORS);
@@ -85,7 +96,7 @@ int main(int argc, char* argv[]) {
   EnsureMobility(nodes.Get(1), Vector(40.0, 15.0, 0.0));
   EnsureMobility(nodes.Get(2), Vector(70.0, 10.0, 0.0));
   EnsureMobility(nodes.Get(3), Vector(30.0, 25.0, 0.0));
-  EnsureMobility(nodes.Get(4), Vector(25.0, 10.0, 0.0));
+  EnsureMobility(nodes.Get(4), Vector(90.0, 20.0, 0.0));
 
   // Standalone UWB anchors placed so that every drone can hear at least 3 anchors
   // across the full operational area (including negative-Y where helpers reposition).
@@ -94,6 +105,8 @@ int main(int argc, char* argv[]) {
   EnsureMobility(nodes.Get(7), Vector(70.0, 10.0, 0.0));
   EnsureMobility(nodes.Get(8), Vector(0.0, -30.0, 0.0));
   EnsureMobility(nodes.Get(9), Vector(-20.0, 10.0, 0.0));
+  EnsureMobility(nodes.Get(10), Vector(90.0, 30.0, 0.0));
+  EnsureMobility(nodes.Get(11), Vector(80.0, -10.0, 0.0));
 
   Ns3BaseStation base(0, nodes.Get(0));
   base.setPosition(0.0, 0.0, 0.0);
@@ -107,6 +120,8 @@ int main(int argc, char* argv[]) {
     {70.0,  10.0, 0.0},
     { 0.0, -30.0, 0.0},
     {-20.0, 10.0, 0.0},
+    {90.0, 30.0, 0.0},
+    {80.0, -10.0, 0.0}
   };
   for (uint32_t i = 0; i < NUM_ANCHORS; ++i) {
     uint8_t anchor_id = static_cast<uint8_t>(NUM_DRONES + 1 + i);  // IDs 5, 6, 7, 8, 9

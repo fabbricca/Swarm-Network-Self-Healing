@@ -5,6 +5,8 @@
 #include <cstring>
 #include <iostream>
 #include <fstream>
+#include <unordered_map>
+#include <unordered_set>
 
 #include "interfaces/position.h"
 
@@ -111,4 +113,12 @@ class Ns3Drone {
   uint16_t m_pos_seq = 0;
   uint16_t m_last_acked_seq = 0;
   double m_last_pos_send_s = 0.0;
+
+  // Multi-hop ACK relay: track which (drone_id, seq) pairs we've already relayed
+  // to prevent broadcast loops while still allowing chained relay beyond 1 hop.
+  std::unordered_map<uint8_t, std::unordered_set<uint16_t>> m_relayed_ack_seqs;
+
+  // HELP_PROXY relay: lost drones relay other lost drones' HELP_PROXY upstream
+  // so in-coverage drones discover all nodes in the chain.
+  std::unordered_set<uint8_t> m_relayed_help_proxy;
 };

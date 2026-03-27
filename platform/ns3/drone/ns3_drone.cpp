@@ -181,12 +181,14 @@ void Ns3Drone::handleCorePacket(const ::Packet& pkt) {
         return;
       }
       if (ack.drone_id != m_id) {
-        // Only relay unicast ACKs from base, not re-broadcasts from other drones.
-        // Without this check, broadcast ACKs create an infinite relay loop.
-        if (pkt.dst == BROADCAST_ID) {
-          return;
+        // Relay ACKs for other drones to support multi-hop chains (scenario 2).
+        // Dedup by (drone_id, seq) so each unique ACK is relayed at most once,
+        // preventing broadcast loops without breaking deeper relay hops.
+        auto& relayed = m_relayed_ack_seqs[ack.drone_id];
+        if (relayed.count(ack.seq)) {
+          return;  // already relayed this ACK
         }
-        // Re-broadcast to swarm so the lost drone can receive it.
+        relayed.insert(ack.seq);
         ::Packet relay_pkt;
         relay_pkt.type = ::PacketType::CORE;
         relay_pkt.src = pkt.src;  // keep original sender
@@ -259,8 +261,26 @@ void Ns3Drone::handleCorePacket(const ::Packet& pkt) {
                   << "," << (coords.size() > 2 ? coords[2] : 0.0) << ")" << std::endl;
       }
 
-      // Enter mission mode to reposition the swarm.
-      startMission();
+      if (!help_proxy_sent && isBaseReachable()) {
+        // Only in-coverage drones (base reachable) enter mission mode to reposition.
+        // Drones that have already lost base connectivity must not start mission —
+        // they are not in a position to serve as relay nodes.
+        startMission();
+      } else if (!isBaseReachable()) {
+        // This drone is itself lost (or about to time out). Relay the HELP_PROXY upstream
+        // so in-coverage drones further up the chain discover all nodes (scenario 2).
+        // Dedup by requester_id: each lost drone relays each unique requester's message once.
+        if (!m_relayed_help_proxy.count(msg.requester_id)) {
+          m_relayed_help_proxy.insert(msg.requester_id);
+          ::Packet relay;
+          relay.type = ::PacketType::CORE;
+          relay.src = m_id;
+          relay.dst = BROADCAST_ID;
+          relay.payload.resize(sizeof(msg));
+          std::memcpy(relay.payload.data(), &msg, sizeof(msg));
+          m_comm.send(relay);
+        }
+      }
       return;
     }
 
@@ -291,7 +311,7 @@ void Ns3Drone::handleCorePacket(const ::Packet& pkt) {
       ::Packet relay_pkt;
       relay_pkt.type = ::PacketType::CORE;
       relay_pkt.src = m_id;  // use our id as sender
-      relay_pkt.dst = m_base_id;
+      relay_pkt.dst = help_proxy_sent ? BROADCAST_ID : m_base_id;
       relay_pkt.payload.resize(sizeof(msg));
       std::memcpy(relay_pkt.payload.data(), &msg, sizeof(msg));
 
@@ -370,6 +390,7 @@ void Ns3Drone::sendHelpProxy() {
 
   m_comm.send(out);
 
+  stopMission();
   help_proxy_sent = true;
 }
 

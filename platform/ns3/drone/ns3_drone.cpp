@@ -307,6 +307,16 @@ void Ns3Drone::handleCorePacket(const ::Packet& pkt) {
         return;
       }
 
+      // Dedup by (drone_id, seq): relay each unique POS_UPDATE at most once.
+      // Without this, multiple lost drones in a mesh relay each other's updates
+      // indefinitely — none of them are the originator, so the originator-id
+      // check above never fires, creating an infinite broadcast storm.
+      auto& relayed = m_relayed_pos_update_seqs[msg.drone_id];
+      if (relayed.count(msg.seq)) {
+        return;  // already relayed this update
+      }
+      relayed.insert(msg.seq);
+
       // Relay to base station.
       ::Packet relay_pkt;
       relay_pkt.type = ::PacketType::CORE;

@@ -118,6 +118,11 @@ class Ns3Drone {
   // to prevent broadcast loops while still allowing chained relay beyond 1 hop.
   std::unordered_map<uint8_t, std::unordered_set<uint16_t>> m_relayed_ack_seqs;
 
+  // Multi-hop POS_UPDATE relay: same dedup pattern as ACK relay — prevents the
+  // broadcast storm that occurs when multiple lost drones form a mesh and each
+  // relay the same POS_UPDATE packet indefinitely.
+  std::unordered_map<uint8_t, std::unordered_set<uint16_t>> m_relayed_pos_update_seqs;
+
   // HELP_PROXY relay: lost drones relay other lost drones' HELP_PROXY upstream
   // so in-coverage drones discover all nodes in the chain.
   std::unordered_set<uint8_t> m_relayed_help_proxy;

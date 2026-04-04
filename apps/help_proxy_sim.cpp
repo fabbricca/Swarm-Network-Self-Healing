@@ -33,23 +33,16 @@ void EnsureMobility(Ptr<Node> node, const Vector& pos) {
 int main(int argc, char* argv[]) {
   Time::SetResolution(Time::NS);
 
-  // Self-healing protocol — automatically handles two multi-drone failure scenarios:
+  // Self-healing protocol — 3-hop relay chain across 10 drones:
   //
-  // Scenario 1 — multiple outside drones, ALL reachable by at least one in-coverage drone:
-  //   Each in-coverage drone is attracted (spring-damper) to all outside drones and to
-  //   the base, converging toward the centroid midpoint. Repulsion spreads helpers to
-  //   cover all outside nodes.
+  // Drones 1-3 (< 50m from base): in base coverage, become relay helpers (mission_active=true).
+  // Drones 4-10 (>= 50m from base): outside base coverage, emit HELP_PROXY.
   //
-  // Scenario 2 — chain: only SOME outside drones can reach in-coverage drones directly:
-  //   The reachable outside drones relay HELP_PROXY upstream so in-coverage drones
-  //   discover the full chain. In-coverage drones reposition to serve the reachable
-  //   outside node; that node passively relays (POS_UPDATE + ACK) for the further node
-  //   via multi-hop deduped broadcast relay. Only in-coverage drones (mission_active=true)
-  //   reposition; outside drones stay put and act as passive relay chain nodes.
+  // Relay topology:
+  //   Base → D1,D2,D3 (direct) → D4,D5 (1-hop lost) → D6,D7,D10 (2-hop lost) → D8,D9 (3-hop lost)
   //
-  // The simulation below demonstrates scenario 2 by default:
-  //   Drone 2 (70,10): outside base coverage, reachable by in-coverage Drone 1 and Drone 3.
-  //   Drone 4 (90,20): outside base coverage, only reachable via Drone 2 (not Drone 1/3).
+  // Lost drones stay put and passively relay HELP_PROXY upstream via multi-hop deduped
+  // broadcast relay. Only in-coverage drones (mission_active=true) reposition.
 
   double maxRangeMeters = 50.0;
   double simSeconds = 300.0;
@@ -80,33 +73,46 @@ int main(int argc, char* argv[]) {
   uwbCfg.maxRangeMeters = maxRangeMeters;
   sim::UwbChannel::Get().Configure(uwbCfg);
 
-  constexpr uint32_t NUM_DRONES = 4;
-  constexpr uint32_t NUM_ANCHORS = 7;  // standalone UWB anchors (base is also an anchor)
+  constexpr uint32_t NUM_DRONES = 10;
+  constexpr uint32_t NUM_ANCHORS = 12;  // standalone UWB anchors (base is also an anchor)
 
   NodeContainer nodes;
   nodes.Create(1 + NUM_DRONES + NUM_ANCHORS);
   // node 0: base station (also UWB anchor)
-  // node 1..4: drones
-  // node 5..9: standalone UWB anchors
+  // node 1..10: drones
+  // node 11..22: standalone UWB anchors
 
-  // Place drone 2 initially outside base coverage so it will timeout and emit HELP_PROXY.
-  // Keep it within range of at least one other drone (drone 3) so the HELP_PROXY can be received,
-  // while keeping it far enough from the base (>= 50m) that it doesn't re-enter immediately.
-  EnsureMobility(nodes.Get(0), Vector(0.0, 0.0, 0.0));
-  EnsureMobility(nodes.Get(1), Vector(40.0, 15.0, 0.0));
-  EnsureMobility(nodes.Get(2), Vector(70.0, 10.0, 0.0));
-  EnsureMobility(nodes.Get(3), Vector(30.0, 25.0, 0.0));
-  EnsureMobility(nodes.Get(4), Vector(90.0, 20.0, 0.0));
+  // Base station
+  EnsureMobility(nodes.Get(0),  Vector(  0.0,   0.0, 0.0));
 
-  // Standalone UWB anchors placed so that every drone can hear at least 3 anchors
-  // across the full operational area (including negative-Y where helpers reposition).
-  EnsureMobility(nodes.Get(5), Vector(40.0, -10.0, 0.0));
-  EnsureMobility(nodes.Get(6), Vector(40.0, 30.0, 0.0));
-  EnsureMobility(nodes.Get(7), Vector(70.0, 10.0, 0.0));
-  EnsureMobility(nodes.Get(8), Vector(0.0, -30.0, 0.0));
-  EnsureMobility(nodes.Get(9), Vector(-20.0, 10.0, 0.0));
-  EnsureMobility(nodes.Get(10), Vector(90.0, 30.0, 0.0));
-  EnsureMobility(nodes.Get(11), Vector(80.0, -10.0, 0.0));
+  // Drones 1-3: inside base coverage (< 50m) — become relay helpers
+  EnsureMobility(nodes.Get(1),  Vector( 35.0,  20.0, 0.0));
+  EnsureMobility(nodes.Get(2),  Vector( 25.0, -15.0, 0.0));
+  EnsureMobility(nodes.Get(3),  Vector( 40.0,  -5.0, 0.0));
+
+  // Drones 4-10: outside base coverage — trigger HELP_PROXY, form relay chain
+  EnsureMobility(nodes.Get(4),  Vector( 70.0,  25.0, 0.0));
+  EnsureMobility(nodes.Get(5),  Vector( 75.0, -20.0, 0.0));
+  EnsureMobility(nodes.Get(6),  Vector(105.0,  30.0, 0.0));
+  EnsureMobility(nodes.Get(7),  Vector(115.0, -10.0, 0.0));
+  EnsureMobility(nodes.Get(8),  Vector(140.0,  25.0, 0.0));
+  EnsureMobility(nodes.Get(9),  Vector(135.0, -20.0, 0.0));
+  EnsureMobility(nodes.Get(10), Vector( 90.0,   5.0, 0.0));
+
+  // UWB anchors (nodes 11-22): 12 anchors covering the full operational area,
+  // ensuring every drone can hear at least 3 anchors within 50m.
+  EnsureMobility(nodes.Get(11), Vector(  0.0, -30.0, 0.0));
+  EnsureMobility(nodes.Get(12), Vector(-20.0,  10.0, 0.0));
+  EnsureMobility(nodes.Get(13), Vector( 40.0, -20.0, 0.0));
+  EnsureMobility(nodes.Get(14), Vector( 40.0,  30.0, 0.0));
+  EnsureMobility(nodes.Get(15), Vector( 65.0,   0.0, 0.0));
+  EnsureMobility(nodes.Get(16), Vector( 70.0, -30.0, 0.0));
+  EnsureMobility(nodes.Get(17), Vector( 80.0,  30.0, 0.0));
+  EnsureMobility(nodes.Get(18), Vector(105.0, -15.0, 0.0));
+  EnsureMobility(nodes.Get(19), Vector(110.0,  20.0, 0.0));
+  EnsureMobility(nodes.Get(20), Vector(130.0, -25.0, 0.0));
+  EnsureMobility(nodes.Get(21), Vector(140.0,  10.0, 0.0));
+  EnsureMobility(nodes.Get(22), Vector(125.0,  35.0, 0.0));
 
   Ns3BaseStation base(0, nodes.Get(0));
   base.setPosition(0.0, 0.0, 0.0);
@@ -115,16 +121,21 @@ int main(int argc, char* argv[]) {
   std::vector<std::unique_ptr<Ns3UwbAnchor>> anchors;
   anchors.reserve(NUM_ANCHORS);
   const Vector anchorPositions[] = {
-    {40.0, -10.0, 0.0},
-    {40.0,  30.0, 0.0},
-    {70.0,  10.0, 0.0},
-    { 0.0, -30.0, 0.0},
-    {-20.0, 10.0, 0.0},
-    {90.0, 30.0, 0.0},
-    {80.0, -10.0, 0.0}
+    {  0.0, -30.0, 0.0},   // A1  (node 11, id 11)
+    {-20.0,  10.0, 0.0},   // A2  (node 12, id 12)
+    { 40.0, -20.0, 0.0},   // A3  (node 13, id 13)
+    { 40.0,  30.0, 0.0},   // A4  (node 14, id 14)
+    { 65.0,   0.0, 0.0},   // A5  (node 15, id 15)
+    { 70.0, -30.0, 0.0},   // A6  (node 16, id 16)
+    { 80.0,  30.0, 0.0},   // A7  (node 17, id 17)
+    {105.0, -15.0, 0.0},   // A8  (node 18, id 18)
+    {110.0,  20.0, 0.0},   // A9  (node 19, id 19)
+    {130.0, -25.0, 0.0},   // A10 (node 20, id 20)
+    {140.0,  10.0, 0.0},   // A11 (node 21, id 21)
+    {125.0,  35.0, 0.0},   // A12 (node 22, id 22)
   };
   for (uint32_t i = 0; i < NUM_ANCHORS; ++i) {
-    uint8_t anchor_id = static_cast<uint8_t>(NUM_DRONES + 1 + i);  // IDs 5, 6, 7, 8, 9
+    uint8_t anchor_id = static_cast<uint8_t>(NUM_DRONES + 1 + i);  // IDs 11..22
     anchors.push_back(std::make_unique<Ns3UwbAnchor>(anchor_id, nodes.Get(NUM_DRONES + 1 + i)));
     anchors.back()->setPosition(anchorPositions[i].x, anchorPositions[i].y, anchorPositions[i].z);
   }
@@ -184,7 +195,7 @@ int main(int argc, char* argv[]) {
             << ", stop=" << simSeconds << "s" << std::endl;
 
   AnimationInterface anim(animOut);
-  anim.SetBackgroundImage("whiteBackground.png", -10, -10, 200, 200, true);
+  anim.SetBackgroundImage("whiteBackground.png", -30, -45, 200, 100, true);
   uint32_t baseStationIcon = anim.AddResource("baseStation.png");
   uint32_t droneIcon = anim.AddResource("drone.png");
 
@@ -238,24 +249,24 @@ int main(int argc, char* argv[]) {
             << "m  avg=" << avg_error << "m\n";
 
   // Midpoint convergence: check if helper drones moved toward the midpoint
-  // between the base station and the lost drone (drone 2, index 1).
+  // between the base station and the deepest-chain lost drone (Drone 8, node 8).
   auto baseMob = nodes.Get(0)->GetObject<ConstantPositionMobilityModel>();
   Vector basePos = baseMob->GetPosition();
-  auto drone2Mob = nodes.Get(2)->GetObject<ConstantPositionMobilityModel>();
-  Vector drone2Pos = drone2Mob->GetPosition();
+  auto drone8Mob = nodes.Get(8)->GetObject<ConstantPositionMobilityModel>();
+  Vector drone8Pos = drone8Mob->GetPosition();
 
-  double midX = (basePos.x + drone2Pos.x) / 2.0;
-  double midY = (basePos.y + drone2Pos.y) / 2.0;
-  double midZ = (basePos.z + drone2Pos.z) / 2.0;
+  double midX = (basePos.x + drone8Pos.x) / 2.0;
+  double midY = (basePos.y + drone8Pos.y) / 2.0;
+  double midZ = (basePos.z + drone8Pos.z) / 2.0;
 
   std::cout << "\nBase station pos=(" << basePos.x << "," << basePos.y << "," << basePos.z << ")"
-            << "\nLost drone (2) pos=(" << drone2Pos.x << "," << drone2Pos.y << "," << drone2Pos.z << ")"
+            << "\nDeepest lost drone (8) pos=(" << drone8Pos.x << "," << drone8Pos.y << "," << drone8Pos.z << ")"
             << "\nIdeal midpoint=(" << midX << "," << midY << "," << midZ << ")\n";
 
-  // Distance of each helper drone (1 and 3) from the midpoint.
+  // Distance of each in-coverage helper drone (IDs 1-3) from the midpoint.
   for (uint32_t i = 0; i < NUM_DRONES; ++i) {
     uint8_t drone_id = drones[i]->id();
-    if (drone_id == 2) continue;  // skip the lost drone itself
+    if (drone_id >= 4) continue;  // skip lost drones (IDs 4..10)
 
     auto dMob = nodes.Get(i + 1)->GetObject<ConstantPositionMobilityModel>();
     Vector dPos = dMob->GetPosition();

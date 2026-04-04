@@ -54,5 +54,5 @@ class Ns3UwbAnchor {
 
   CommunicationManager m_comm;
 
-  double m_beacon_dt_s = 0.01;  // 100 Hz beacon rate (realistic UWB TDoA)
+  double m_beacon_dt_s = 0.1;  // 10 Hz beacon rate (sufficient for trilateration; 100 Hz overloads NS-3 at scale)
 };

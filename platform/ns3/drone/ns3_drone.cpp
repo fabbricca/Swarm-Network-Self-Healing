@@ -88,7 +88,11 @@ void Ns3Drone::stopMission() {
 
 void Ns3Drone::onTick() {
   const double now_s = ::ns3::Simulator::Now().GetSeconds();
-  if (m_waiting_ack && (now_s - m_last_ack_rx_s) > m_ack_timeout_s && !help_proxy_sent) {
+  // Only emit HELP_PROXY if this drone is NOT already repositioning as a relay helper.
+  // A mission-active drone may temporarily leave base coverage while transiting toward
+  // the midpoint equilibrium — this is expected overshoot, not a loss of connectivity.
+  if (m_waiting_ack && (now_s - m_last_ack_rx_s) > m_ack_timeout_s
+      && !help_proxy_sent && !m_controller.isMissionActive()) {
     sendHelpProxy();
     m_waiting_ack = false;
   }
@@ -160,6 +164,14 @@ void Ns3Drone::dispatchPacket(const ::Packet& pkt) {
     return;
   }
 
+  // Count by packet category (CORE sub-types are counted inside handleCorePacket).
+  switch (pkt.type) {
+    case ::PacketType::FLOOD:      ++m_rx_stats.flood;      break;
+    case ::PacketType::NEIGHBOR:   ++m_rx_stats.neighbor;   break;
+    case ::PacketType::UWB_BEACON: ++m_rx_stats.uwb_beacon; break;
+    default: break;
+  }
+
   m_dispatcher.handlePacket(pkt);
 }
 
@@ -171,6 +183,7 @@ void Ns3Drone::handleCorePacket(const ::Packet& pkt) {
   const auto type = static_cast<SimMsgType>(pkt.payload[0]);
   switch (type) {
     case SimMsgType::POS_ACK: {
+      ++m_rx_stats.pos_ack;
       if (pkt.payload.size() < sizeof(PositionAckMsg)) {
         return;
       }
@@ -235,6 +248,7 @@ void Ns3Drone::handleCorePacket(const ::Packet& pkt) {
     }
 
     case SimMsgType::HELP_PROXY: {
+      ++m_rx_stats.help_proxy;
       if (pkt.payload.size() < sizeof(HelpProxyMsg)) {
         return;
       }
@@ -285,6 +299,7 @@ void Ns3Drone::handleCorePacket(const ::Packet& pkt) {
     }
 
     case SimMsgType::POS_UPDATE:{
+      ++m_rx_stats.pos_update;
       if (pkt.payload.size() < sizeof(PositionUpdateMsg)) {
         return;
       }

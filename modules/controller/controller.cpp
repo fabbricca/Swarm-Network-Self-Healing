@@ -1,5 +1,6 @@
 #include "modules/controller/controller.h"
 #include <iostream>
+#include <unordered_map>
 
 Controller::Controller(
     uint8_t self_id,
@@ -80,16 +81,37 @@ void Controller::step(
     position->retrieveCurrentPosition();
     const uint8_t hops_from_base_station = flooding_manager->getHopsFromBase();
 
-    Vector3D F_tot = Vector3D{0.0f, 0.0f, 0.0f};
+    // Group neighbors by hop count so that N drones at the same hop act as
+    // a single virtual drone at their centroid.  Without this, 2 outside drones
+    // pull twice as hard as 1 base, shifting equilibrium to 2/3 instead of 1/2.
+    std::unordered_map<uint8_t, std::vector<std::vector<double>>> hop_groups;
     for (const NeighborInfoInterface* neighbor : neighbors) {
-        const uint8_t neighbor_hops = neighbor->getHopsToBaseStation();
-        Vector3D diff = position->distanceFromCoords(neighbor->getPosition());
-        if (neighbor_hops < hops_from_base_station || neighbor_hops > hops_from_base_station) {
-            // Attractive force
-            computeAttractiveForces(diff, F_tot);
+        const uint8_t nh = neighbor->getHopsToBaseStation();
+        if (nh != hops_from_base_station) {
+            hop_groups[nh].push_back(neighbor->getPosition());
         }
+    }
+
+    Vector3D F_tot = Vector3D{0.0f, 0.0f, 0.0f};
+
+    // Attractive force: one per hop group, toward the group centroid.
+    for (const auto& [hop, positions] : hop_groups) {
+        double cx = 0.0, cy = 0.0, cz = 0.0;
+        for (const auto& p : positions) {
+            cx += p[0];
+            cy += (p.size() > 1 ? p[1] : 0.0);
+            cz += (p.size() > 2 ? p[2] : 0.0);
+        }
+        const double n = static_cast<double>(positions.size());
+        std::vector<double> centroid = {cx / n, cy / n, cz / n};
+        Vector3D diff = position->distanceFromCoords(centroid);
+        computeAttractiveForces(diff, F_tot);
+    }
+
+    // Repulsive force: per individual neighbor (collision avoidance).
+    for (const NeighborInfoInterface* neighbor : neighbors) {
+        Vector3D diff = position->distanceFromCoords(neighbor->getPosition());
         if (diff.module() < D_safe) {
-            // Repulsive force
             computeRepulsiveForces(diff, F_tot);
         }
     }

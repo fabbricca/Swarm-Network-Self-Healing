@@ -79,7 +79,10 @@ void FloodManager::startFlood(uint16_t flood_id) {
     FloodDiscoveryMsg msg;
     msg.flood_id = flood_id;
     msg.initiator_id = self_id;
-    msg.hop_to_base = 0;
+    // The initiator IS 1 hop from base.  Broadcast this actual hop count so
+    // that non-base-reachable recipients compute 1+1=2 (correct) instead of
+    // 0+1=1 which collides with the stale-detection filter in getHopsFromBase().
+    msg.hop_to_base = 1;
 
     seen_floods.insert(flood_id);
     best_hop_to_base[flood_id] = 1;

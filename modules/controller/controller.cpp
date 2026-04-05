@@ -80,16 +80,39 @@ void Controller::step(
     position->retrieveCurrentPosition();
     const uint8_t hops_from_base_station = flooding_manager->getHopsFromBase();
 
+    // Count lower-hop and higher-hop neighbors so we can weight each side by the
+    // OTHER side's count.  Without this, N higher-hop drones pull N times harder
+    // than a single base, shifting the equilibrium away from the midpoint.
+    //
+    // Scaling each lower-hop attraction by N_higher and each higher-hop attraction
+    // by N_lower places the equilibrium exactly at (centroid_low + centroid_high)/2:
+    //   Σ w_i*(p_i - s) = 0  ⇒  s = centroid_L/2 + centroid_H/2
+    // In the common case N_lower=1, this reduces to "weigh the base as many times
+    // as the higher-hop drones heard".
+    uint32_t n_lower = 0, n_higher = 0;
+    for (const NeighborInfoInterface* neighbor : neighbors) {
+        const uint8_t nh = neighbor->getHopsToBaseStation();
+        if (nh < hops_from_base_station)      ++n_lower;
+        else if (nh > hops_from_base_station) ++n_higher;
+    }
+
     Vector3D F_tot = Vector3D{0.0f, 0.0f, 0.0f};
     for (const NeighborInfoInterface* neighbor : neighbors) {
         const uint8_t neighbor_hops = neighbor->getHopsToBaseStation();
         Vector3D diff = position->distanceFromCoords(neighbor->getPosition());
-        if (neighbor_hops < hops_from_base_station || neighbor_hops > hops_from_base_station) {
-            // Attractive force
-            computeAttractiveForces(diff, F_tot);
+        if (neighbor_hops < hops_from_base_station) {
+            // Lower-hop (toward base): weighted by number of higher-hop neighbors.
+            for (uint32_t i = 0; i < n_higher; ++i) {
+                computeAttractiveForces(diff, F_tot);
+            }
+        } else if (neighbor_hops > hops_from_base_station) {
+            // Higher-hop (toward lost drones): weighted by number of lower-hop neighbors.
+            for (uint32_t i = 0; i < n_lower; ++i) {
+                computeAttractiveForces(diff, F_tot);
+            }
         }
         if (diff.module() < D_safe) {
-            // Repulsive force
+            // Repulsive force: per individual neighbor (collision avoidance).
             computeRepulsiveForces(diff, F_tot);
         }
     }

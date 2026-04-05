@@ -1,5 +1,6 @@
 #include <cmath>
 #include <cstdint>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -95,7 +96,7 @@ int main(int argc, char* argv[]) {
   EnsureMobility(nodes.Get(5),  Vector( 75.0, -20.0, 0.0));
   EnsureMobility(nodes.Get(6),  Vector(105.0,  30.0, 0.0));
   EnsureMobility(nodes.Get(7),  Vector(115.0, -10.0, 0.0));
-  EnsureMobility(nodes.Get(8),  Vector(140.0,  25.0, 0.0));
+  EnsureMobility(nodes.Get(8),  Vector(60.0,  25.0, 0.0));
   EnsureMobility(nodes.Get(9),  Vector(135.0, -20.0, 0.0));
   EnsureMobility(nodes.Get(10), Vector( 90.0,   5.0, 0.0));
 
@@ -216,68 +217,154 @@ int main(int argc, char* argv[]) {
   // ── End-of-simulation performance metrics ──
   std::cout << "\n========== END-OF-SIMULATION METRICS ==========\n";
 
-  // Ground truth from NS-3 mobility model vs trilaterated position from UWB.
-  double total_error = 0.0;
-  double min_error = std::numeric_limits<double>::max();
-  double max_error = 0.0;
+  // Collect final positions for all drones.
+  struct DroneInfo { uint8_t id; bool lost; uint8_t hops; Vector gt; std::vector<double> tri; double err; };
+  std::vector<DroneInfo> info;
+  double total_error = 0.0, min_error = std::numeric_limits<double>::max(), max_error = 0.0;
 
   for (uint32_t i = 0; i < NUM_DRONES; ++i) {
     auto mob = nodes.Get(i + 1)->GetObject<ConstantPositionMobilityModel>();
     Vector gt = mob->GetPosition();
-
     auto* pos = drones[i]->position();
-    std::vector<double> tri = pos ? pos->getCoordinates() : std::vector<double>{0, 0, 0};
-
-    double dx = gt.x - tri[0];
-    double dy = gt.y - tri[1];
-    double dz = gt.z - tri[2];
-    double err = std::sqrt(dx * dx + dy * dy + dz * dz);
-
+    std::vector<double> tri = pos ? pos->getCoordinates() : std::vector<double>{0.0, 0.0, 0.0};
+    double dx = gt.x - tri[0], dy = gt.y - tri[1], dz = gt.z - tri[2];
+    double err = std::sqrt(dx*dx + dy*dy + dz*dz);
     min_error = std::min(min_error, err);
     max_error = std::max(max_error, err);
     total_error += err;
-
-    std::cout << "[Drone " << static_cast<int>(drones[i]->id()) << "] "
-              << "ground_truth=(" << gt.x << "," << gt.y << "," << gt.z << ") "
-              << "trilaterated=(" << tri[0] << "," << tri[1] << "," << tri[2] << ") "
-              << "error=" << err << "m" << std::endl;
+    bool lost = (drones[i]->id() >= 4);
+    uint8_t hops = drones[i]->hopsFromBase();
+    info.push_back({drones[i]->id(), lost, hops, gt, tri, err});
   }
 
-  double avg_error = total_error / NUM_DRONES;
-  std::cout << "\nTrilateration error: min=" << min_error
+  // ── 1. Drone positions, hop count & trilateration error ──
+  std::cout << "\n── Drone Positions, Hops & Trilateration Error ──\n";
+  std::cout << std::left
+            << std::setw(8)  << "Drone"
+            << std::setw(10) << "Role"
+            << std::setw(7)  << "Hops"
+            << std::setw(28) << "Ground truth (x,y,z)"
+            << std::setw(28) << "Trilaterated (x,y,z)"
+            << "Error\n";
+  for (const auto& d : info) {
+    std::string hops_str = (d.hops == 0xFF) ? "?" : std::to_string(static_cast<int>(d.hops));
+    std::string gt_str   = "(" + std::to_string(d.gt.x) + "," + std::to_string(d.gt.y) + "," + std::to_string(d.gt.z) + ")";
+    std::string tri_str  = "(" + std::to_string(d.tri[0]) + "," + std::to_string(d.tri[1]) + "," + std::to_string(d.tri[2]) + ")";
+    std::cout << std::left
+              << std::setw(8)  << static_cast<int>(d.id)
+              << std::setw(10) << (d.lost ? "lost" : "helper")
+              << std::setw(7)  << hops_str
+              << std::setw(28) << gt_str
+              << std::setw(28) << tri_str
+              << d.err << "m\n";
+  }
+  std::cout << "Trilateration: min=" << min_error
             << "m  max=" << max_error
-            << "m  avg=" << avg_error << "m\n";
+            << "m  avg=" << (total_error / NUM_DRONES) << "m\n";
 
-  // Midpoint convergence: check if helper drones moved toward the midpoint
-  // between the base station and the deepest-chain lost drone (Drone 8, node 8).
+  // ── 2. Packet receive counts by type ──
+  std::cout << "\n── Packet Receive Counts (by type) ──\n";
+  std::cout << std::left
+            << std::setw(8)  << "Drone"
+            << std::setw(10) << "Role"
+            << std::setw(7)  << "Hops"
+            << std::setw(13) << "POS_UPDATE"
+            << std::setw(10) << "POS_ACK"
+            << std::setw(13) << "HELP_PROXY"
+            << std::setw(8)  << "FLOOD"
+            << std::setw(11) << "NEIGHBOR"
+            << "UWB_BEACON\n";
+  for (uint32_t i = 0; i < NUM_DRONES; ++i) {
+    const auto& s = drones[i]->rxStats();
+    std::string hops_str = (info[i].hops == 0xFF) ? "?" : std::to_string(static_cast<int>(info[i].hops));
+    std::cout << std::left
+              << std::setw(8)  << static_cast<int>(drones[i]->id())
+              << std::setw(10) << (info[i].lost ? "lost" : "helper")
+              << std::setw(7)  << hops_str
+              << std::setw(13) << s.pos_update
+              << std::setw(10) << s.pos_ack
+              << std::setw(13) << s.help_proxy
+              << std::setw(8)  << s.flood
+              << std::setw(11) << s.neighbor
+              << s.uwb_beacon << "\n";
+  }
+
+  // ── 3. Per-helper midpoint convergence ──
+  // Each helper drone only hears hop-2 drones within maxRangeMeters.  Its centroid
+  // (and therefore its ideal midpoint) depends on which hop-2 drones it can see.
   auto baseMob = nodes.Get(0)->GetObject<ConstantPositionMobilityModel>();
   Vector basePos = baseMob->GetPosition();
-  auto drone8Mob = nodes.Get(8)->GetObject<ConstantPositionMobilityModel>();
-  Vector drone8Pos = drone8Mob->GetPosition();
 
-  double midX = (basePos.x + drone8Pos.x) / 2.0;
-  double midY = (basePos.y + drone8Pos.y) / 2.0;
-  double midZ = (basePos.z + drone8Pos.z) / 2.0;
+  // Collect hop-2 drones.
+  std::vector<const DroneInfo*> hop2_drones;
+  for (const auto& d : info) {
+    if (d.hops == 2) hop2_drones.push_back(&d);
+  }
 
-  std::cout << "\nBase station pos=(" << basePos.x << "," << basePos.y << "," << basePos.z << ")"
-            << "\nDeepest lost drone (8) pos=(" << drone8Pos.x << "," << drone8Pos.y << "," << drone8Pos.z << ")"
-            << "\nIdeal midpoint=(" << midX << "," << midY << "," << midZ << ")\n";
+  // Global centroid (for reference).
+  double gcx = 0.0, gcy = 0.0, gcz = 0.0;
+  for (const auto* d : hop2_drones) { gcx += d->gt.x; gcy += d->gt.y; gcz += d->gt.z; }
+  if (!hop2_drones.empty()) {
+    double n = static_cast<double>(hop2_drones.size());
+    gcx /= n; gcy /= n; gcz /= n;
+  }
+  double gmidX = (basePos.x + gcx) / 2.0;
+  double gmidY = (basePos.y + gcy) / 2.0;
+  double gmidZ = (basePos.z + gcz) / 2.0;
 
-  // Distance of each in-coverage helper drone (IDs 1-3) from the midpoint.
-  for (uint32_t i = 0; i < NUM_DRONES; ++i) {
-    uint8_t drone_id = drones[i]->id();
-    if (drone_id >= 4) continue;  // skip lost drones (IDs 4..10)
+  std::cout << "\n── Per-Helper Midpoint Convergence ──\n";
+  std::cout << "Base station: (" << basePos.x << "," << basePos.y << "," << basePos.z << ")\n";
+  if (!hop2_drones.empty()) {
+    std::cout << "Global hop-2 centroid (" << hop2_drones.size() << " drones): ("
+              << gcx << "," << gcy << "," << gcz << ")\n";
+    std::cout << "Global ideal midpoint: (" << gmidX << "," << gmidY << "," << gmidZ << ")\n";
+  }
 
-    auto dMob = nodes.Get(i + 1)->GetObject<ConstantPositionMobilityModel>();
-    Vector dPos = dMob->GetPosition();
-    double dist = std::sqrt(
-      (dPos.x - midX) * (dPos.x - midX) +
-      (dPos.y - midY) * (dPos.y - midY) +
-      (dPos.z - midZ) * (dPos.z - midZ));
+  std::cout << "\n";
+  for (const auto& h : info) {
+    if (h.lost) continue;
 
-    std::cout << "[Drone " << static_cast<int>(drone_id)
-              << "] final_pos=(" << dPos.x << "," << dPos.y << "," << dPos.z << ")"
-              << " dist_to_midpoint=" << dist << "m" << std::endl;
+    // Find hop-2 drones within range of this helper.
+    std::vector<const DroneInfo*> visible;
+    for (const auto* d : hop2_drones) {
+      double dx = h.gt.x - d->gt.x, dy = h.gt.y - d->gt.y, dz = h.gt.z - d->gt.z;
+      if (std::sqrt(dx*dx + dy*dy + dz*dz) <= maxRangeMeters) {
+        visible.push_back(d);
+      }
+    }
+
+    std::string hops_str = (h.hops == 0xFF) ? "?" : std::to_string(static_cast<int>(h.hops));
+    std::cout << "  helper " << static_cast<int>(h.id)
+              << " (hops=" << hops_str << ")"
+              << "  pos=(" << h.gt.x << "," << h.gt.y << "," << h.gt.z << ")\n";
+
+    if (visible.empty()) {
+      std::cout << "    sees: no hop-2 drones in range — did not start mission\n";
+      continue;
+    }
+
+    // Per-helper centroid and midpoint.
+    double lcx = 0.0, lcy = 0.0, lcz = 0.0;
+    std::cout << "    sees:";
+    for (const auto* v : visible) {
+      std::cout << " D" << static_cast<int>(v->id)
+                << "(" << v->gt.x << "," << v->gt.y << ")";
+      lcx += v->gt.x; lcy += v->gt.y; lcz += v->gt.z;
+    }
+    double vn = static_cast<double>(visible.size());
+    lcx /= vn; lcy /= vn; lcz /= vn;
+    std::cout << "\n";
+
+    double lmidX = (basePos.x + lcx) / 2.0;
+    double lmidY = (basePos.y + lcy) / 2.0;
+    double lmidZ = (basePos.z + lcz) / 2.0;
+    double dist = std::sqrt((h.gt.x-lmidX)*(h.gt.x-lmidX)
+                          + (h.gt.y-lmidY)*(h.gt.y-lmidY)
+                          + (h.gt.z-lmidZ)*(h.gt.z-lmidZ));
+
+    std::cout << "    local centroid: (" << lcx << "," << lcy << "," << lcz << ")"
+              << "  local midpoint: (" << lmidX << "," << lmidY << "," << lmidZ << ")"
+              << "  dist=" << dist << "m\n";
   }
 
   std::cout << "================================================\n" << std::endl;

@@ -28,6 +28,16 @@
 #include "platform/ns3/velocity_actuator/ns3_velocity_actuator.h"
 #include "platform/ns3/uwb_transport/uwb_transport.h"
 
+// Per-drone packet receive counters broken down by message type.
+struct DronePacketStats {
+  uint32_t pos_update  = 0;
+  uint32_t pos_ack     = 0;
+  uint32_t help_proxy  = 0;
+  uint32_t flood       = 0;
+  uint32_t neighbor    = 0;
+  uint32_t uwb_beacon  = 0;
+};
+
 // NS-3 bound drone node logic.
 // - While not in mission: periodically unicast PositionUpdateMsg to base and wait for PositionAckMsg.
 // - If ACK is missing for too long: broadcast HelpProxyMsg.
@@ -57,6 +67,12 @@ class Ns3Drone {
   void start();
 
   void setRepositionLogger(const std::shared_ptr<std::ofstream>& csv);
+
+  const DronePacketStats& rxStats() const { return m_rx_stats; }
+
+  uint8_t hopsFromBase() const {
+    return m_flood_manager ? m_flood_manager->getHopsFromBase() : 0xFF;
+  }
 
  private:
   void onTick();
@@ -113,6 +129,8 @@ class Ns3Drone {
   uint16_t m_pos_seq = 0;
   uint16_t m_last_acked_seq = 0;
   double m_last_pos_send_s = 0.0;
+
+  DronePacketStats m_rx_stats;
 
   // Multi-hop ACK relay: track which (drone_id, seq) pairs we've already relayed
   // to prevent broadcast loops while still allowing chained relay beyond 1 hop.

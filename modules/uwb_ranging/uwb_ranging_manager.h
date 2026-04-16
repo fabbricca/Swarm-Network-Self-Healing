@@ -47,7 +47,10 @@ class UwbRangingManager : public UwbRangingManagerInterface {
   std::function<double()> m_get_time_s;
   double m_speed_of_light_mps;
   double m_noise_std_dev_m;
-  double m_stale_threshold_s = 0.5;  // drop anchors not heard for this long
+  // Drop anchors we haven't heard from for this long.  Lifted from 0.5 s to 1.5 s
+  // when anchor beacons moved to 2 Hz — we still want to prune truly-out-of-range
+  // anchors but must not expire the current ones between consecutive beacons.
+  double m_stale_threshold_s = 1.5;
 
   // Latest range measurement per anchor (overwritten each beacon).
   std::unordered_map<uint8_t, AnchorMeasurement> m_measurements;

@@ -44,6 +44,10 @@ class Ns3BaseStation : public Ns3UwbAnchor {
   std::unordered_map<uint8_t, bool> m_drone_ids;
   std::unordered_map<uint8_t, PositionUpdateMsg> m_last_position;
 
-  double m_tick_dt_s = 0.05;
+  // Flood interval: each tick the base seeds a new flood that propagates
+  // through the swarm.  At 50 ms this was the single biggest source of radio
+  // traffic; 2.5 s still refreshes hop counts faster than the swarm reshapes
+  // in our scenarios (topology is effectively static after t≈2 s).
+  double m_tick_dt_s = 2.5;
   uint16_t m_flood_seq = 0;
 };

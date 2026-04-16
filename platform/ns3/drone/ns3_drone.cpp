@@ -1,5 +1,7 @@
 #include "platform/ns3/drone/ns3_drone.h"
 
+#include <cmath>
+
 Ns3Drone::Ns3Drone(
   uint8_t id,
   ::ns3::Ptr<::ns3::Node> node,
@@ -88,7 +90,30 @@ void Ns3Drone::stopMission() {
 
 void Ns3Drone::onTick() {
   const double now_s = ::ns3::Simulator::Now().GetSeconds();
-  if (m_waiting_ack && (now_s - m_last_ack_rx_s) > m_ack_timeout_s && !help_proxy_sent) {
+
+  // Ground-truth distance accumulation.  We sample the mobility model (not the
+  // trilaterated estimate) so UWB noise doesn't inflate the metric — the point
+  // of the metric is to compare how much drones *actually* move across
+  // formation-control variants.
+  if (auto mob = m_node ? m_node->GetObject<::ns3::ConstantPositionMobilityModel>() : nullptr) {
+    const ::ns3::Vector p = mob->GetPosition();
+    if (m_has_prev_gt_pos) {
+      const double dx = p.x - m_prev_gt_x;
+      const double dy = p.y - m_prev_gt_y;
+      const double dz = p.z - m_prev_gt_z;
+      m_total_distance_m += std::sqrt(dx * dx + dy * dy + dz * dz);
+    }
+    m_prev_gt_x = p.x;
+    m_prev_gt_y = p.y;
+    m_prev_gt_z = p.z;
+    m_has_prev_gt_pos = true;
+  }
+
+  // Only emit HELP_PROXY if this drone is NOT already repositioning as a relay helper.
+  // A mission-active drone may temporarily leave base coverage while transiting toward
+  // the midpoint equilibrium — this is expected overshoot, not a loss of connectivity.
+  if (m_waiting_ack && (now_s - m_last_ack_rx_s) > m_ack_timeout_s
+      && !help_proxy_sent && !m_controller.isMissionActive()) {
     sendHelpProxy();
     m_waiting_ack = false;
   }
@@ -160,6 +185,14 @@ void Ns3Drone::dispatchPacket(const ::Packet& pkt) {
     return;
   }
 
+  // Count by packet category (CORE sub-types are counted inside handleCorePacket).
+  switch (pkt.type) {
+    case ::PacketType::FLOOD:      ++m_rx_stats.flood;      break;
+    case ::PacketType::NEIGHBOR:   ++m_rx_stats.neighbor;   break;
+    case ::PacketType::UWB_BEACON: ++m_rx_stats.uwb_beacon; break;
+    default: break;
+  }
+
   m_dispatcher.handlePacket(pkt);
 }
 
@@ -171,6 +204,7 @@ void Ns3Drone::handleCorePacket(const ::Packet& pkt) {
   const auto type = static_cast<SimMsgType>(pkt.payload[0]);
   switch (type) {
     case SimMsgType::POS_ACK: {
+      ++m_rx_stats.pos_ack;
       if (pkt.payload.size() < sizeof(PositionAckMsg)) {
         return;
       }
@@ -235,6 +269,7 @@ void Ns3Drone::handleCorePacket(const ::Packet& pkt) {
     }
 
     case SimMsgType::HELP_PROXY: {
+      ++m_rx_stats.help_proxy;
       if (pkt.payload.size() < sizeof(HelpProxyMsg)) {
         return;
       }
@@ -285,6 +320,7 @@ void Ns3Drone::handleCorePacket(const ::Packet& pkt) {
     }
 
     case SimMsgType::POS_UPDATE:{
+      ++m_rx_stats.pos_update;
       if (pkt.payload.size() < sizeof(PositionUpdateMsg)) {
         return;
       }
@@ -340,12 +376,30 @@ void Ns3Drone::sendPositionUpdate() {
   }
 
   const double now_s = ::ns3::Simulator::Now().GetSeconds();
-  if ((now_s - m_last_pos_send_s) < m_tick_dt_s) {
+  if ((now_s - m_last_pos_send_s) < m_pos_update_interval_s) {
     return;
   }
 
   m_uwb_position->retrieveCurrentPosition();
   const auto coords = m_uwb_position->getCoordinates();
+
+  // Delta gate: once the minimum 500 ms has elapsed, skip this send if the
+  // drone hasn't moved enough AND we're still within the max-interval window.
+  // The max-interval fallback guarantees a heartbeat even when the drone is
+  // perfectly stationary, so the base's reachability logic keeps working.
+  const double cur_x = coords.size() > 0 ? coords[0] : 0.0;
+  const double cur_y = coords.size() > 1 ? coords[1] : 0.0;
+  const double cur_z = coords.size() > 2 ? coords[2] : 0.0;
+  if (m_has_last_sent_pos
+      && (now_s - m_last_pos_send_s) < m_pos_update_max_interval_s) {
+    const double dx = cur_x - m_last_sent_x;
+    const double dy = cur_y - m_last_sent_y;
+    const double dz = cur_z - m_last_sent_z;
+    const double dist_sq = dx * dx + dy * dy + dz * dz;
+    if (dist_sq < (m_pos_delta_threshold_m * m_pos_delta_threshold_m)) {
+      return;
+    }
+  }
 
   // If help proxy was sent, send position updates via broadcast to inform helpers.
   // Otherwise, unicast to base station.
@@ -367,6 +421,10 @@ void Ns3Drone::sendPositionUpdate() {
 
   m_comm.send(out);
   m_last_pos_send_s = now_s;
+  m_last_sent_x = cur_x;
+  m_last_sent_y = cur_y;
+  m_last_sent_z = cur_z;
+  m_has_last_sent_pos = true;
   m_waiting_ack = true;
 }
 

@@ -28,6 +28,16 @@
 #include "platform/ns3/velocity_actuator/ns3_velocity_actuator.h"
 #include "platform/ns3/uwb_transport/uwb_transport.h"
 
+// Per-drone packet receive counters broken down by message type.
+struct DronePacketStats {
+  uint32_t pos_update  = 0;
+  uint32_t pos_ack     = 0;
+  uint32_t help_proxy  = 0;
+  uint32_t flood       = 0;
+  uint32_t neighbor    = 0;
+  uint32_t uwb_beacon  = 0;
+};
+
 // NS-3 bound drone node logic.
 // - While not in mission: periodically unicast PositionUpdateMsg to base and wait for PositionAckMsg.
 // - If ACK is missing for too long: broadcast HelpProxyMsg.
@@ -57,6 +67,14 @@ class Ns3Drone {
   void start();
 
   void setRepositionLogger(const std::shared_ptr<std::ofstream>& csv);
+
+  const DronePacketStats& rxStats() const { return m_rx_stats; }
+
+  double totalDistanceTraveled() const { return m_total_distance_m; }
+
+  uint8_t hopsFromBase() const {
+    return m_flood_manager ? m_flood_manager->getHopsFromBase() : 0xFF;
+  }
 
  private:
   void onTick();
@@ -113,6 +131,33 @@ class Ns3Drone {
   uint16_t m_pos_seq = 0;
   uint16_t m_last_acked_seq = 0;
   double m_last_pos_send_s = 0.0;
+  // POS_UPDATE is decoupled from the 20 Hz physics tick: the base only needs
+  // fresh-enough reachability evidence, and broadcasting 20×/s per drone was
+  // the dominant CORE-traffic source.
+  double m_pos_update_interval_s = 0.5;
+
+  // Delta-based gate on POS_UPDATE: once the 500 ms minimum has passed, skip
+  // the send if the drone hasn't moved meaningfully since the previous send.
+  // The max-interval fallback must stay below m_ack_timeout_s (1.5 s) — a
+  // stationary drone still needs regular heartbeats so the base doesn't
+  // declare it lost and so it doesn't self-trigger HELP_PROXY.
+  double m_last_sent_x = 0.0;
+  double m_last_sent_y = 0.0;
+  double m_last_sent_z = 0.0;
+  bool m_has_last_sent_pos = false;
+  double m_pos_delta_threshold_m = 0.2;
+  double m_pos_update_max_interval_s = 1.0;
+
+  DronePacketStats m_rx_stats;
+
+  // Ground-truth distance accumulation (sampled each physics tick from the
+  // mobility model, not the trilaterated estimate, so noise doesn't inflate
+  // the metric).
+  double m_total_distance_m = 0.0;
+  bool m_has_prev_gt_pos = false;
+  double m_prev_gt_x = 0.0;
+  double m_prev_gt_y = 0.0;
+  double m_prev_gt_z = 0.0;
 
   // Multi-hop ACK relay: track which (drone_id, seq) pairs we've already relayed
   // to prevent broadcast loops while still allowing chained relay beyond 1 hop.

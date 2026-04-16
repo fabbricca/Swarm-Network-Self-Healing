@@ -54,5 +54,10 @@ class Ns3UwbAnchor {
 
   CommunicationManager m_comm;
 
-  double m_beacon_dt_s = 0.1;  // 10 Hz beacon rate (sufficient for trilateration; 100 Hz overloads NS-3 at scale)
+  // 2 Hz beacon rate: matches POS_UPDATE cadence (see Ns3Drone::m_pos_update_interval_s)
+  // so each trilateration feeds exactly one outbound heartbeat.  10 Hz was chosen
+  // originally as a "sufficient" figure but produced ~40-70 receives/s/drone, which
+  // dominated radio-on time.  UwbRangingManager::m_stale_threshold_s was lifted to
+  // 1.5 s to accommodate the slower cadence.
+  double m_beacon_dt_s = 0.5;
 };

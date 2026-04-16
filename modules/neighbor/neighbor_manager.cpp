@@ -54,7 +54,29 @@ void NeighborManager::sendToNeighbors(
         return;
     }
 
+    const uint32_t this_call = m_call_count++;
     const std::vector<double> coords = position->getCoordinates();
+
+    // Gate: honor the min-interval, then skip sends that bring no new info
+    // unless the max-interval heartbeat window has elapsed (see header).
+    if (m_has_last_sent) {
+        const uint32_t calls_since = this_call - m_last_sent_call;
+        if (calls_since < MIN_CALLS_BETWEEN_SENDS) {
+            return;
+        }
+        if (calls_since < MAX_CALLS_BETWEEN_SENDS) {
+            double dist_sq = 0.0;
+            const size_t n = std::min(coords.size(), m_last_sent_coords.size());
+            for (size_t i = 0; i < n; ++i) {
+                const double d = coords[i] - m_last_sent_coords[i];
+                dist_sq += d * d;
+            }
+            if (dist_sq < (NEIGHBOR_DELTA_THRESHOLD_M * NEIGHBOR_DELTA_THRESHOLD_M)) {
+                return;
+            }
+        }
+    }
+
     NeighborInfo info(id, hops_to_base_station, coords);
 
     ::Packet pkt;
@@ -64,4 +86,8 @@ void NeighborManager::sendToNeighbors(
     info.serialize(pkt.payload);
 
     m_communication_manager->send(pkt);
+
+    m_last_sent_call = this_call;
+    m_last_sent_coords = coords;
+    m_has_last_sent = true;
 }

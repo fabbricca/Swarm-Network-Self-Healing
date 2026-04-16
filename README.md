@@ -165,6 +165,22 @@ docker run --rm swarm-sim sim \
   --animOut=/project/output/drone-simulation.xml
 ```
 
+### Formation Control Algorithm
+
+Select the formation-control strategy with `--algorithm` (default: `centroid`):
+
+```bash
+docker run --rm swarm-sim sim --algorithm=centroid   # hop-group centroid
+docker run --rm swarm-sim sim --algorithm=weighted   # count-weighted per-neighbor
+```
+
+- `centroid` — neighbors at the same hop count contribute a single attractive
+  force toward their centroid. N drones at one hop pull as a single virtual
+  drone, so the equilibrium sits on the midpoint between sides.
+- `weighted` — each attraction to a lower-hop neighbor is scaled by the number
+  of higher-hop neighbors and vice versa. The Σw·(p−s)=0 solution places the
+  equilibrium exactly at (centroid_low + centroid_high)/2.
+
 ### Parameter Tuner
 
 Run the grid search tuner to optimize controller parameters:

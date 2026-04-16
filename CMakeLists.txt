@@ -8,7 +8,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 add_executable(swarm_demo_sim1
 	apps/help_proxy_sim.cpp
 	platform/ns3/base_station/ns3_base_station.cpp
-	modules/controller/controller.cpp
+	modules/controller/controller_base.cpp
+	modules/controller/centroid_controller.cpp
+	modules/controller/weighted_controller.cpp
+	modules/controller/controller_factory.cpp
 	modules/communication/communication_manager.cpp
 	modules/dispatch/dispatch_manager.cpp
 	platform/ns3/drone/ns3_drone.cpp

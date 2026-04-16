@@ -11,7 +11,8 @@
 #include "interfaces/position.h"
 
 #include "modules/communication/communication_manager.h"
-#include "modules/controller/controller.h"
+#include "interfaces/controller.h"
+#include "modules/controller/controller_factory.h"
 #include "modules/dispatch/dispatch_manager.h"
 #include "modules/flood/flood_manager.h"
 #include "modules/neighbor/neighbor_manager.h"
@@ -47,6 +48,7 @@ class Ns3Drone {
   Ns3Drone(
     uint8_t id,
     ::ns3::Ptr<::ns3::Node> node,
+    ControllerAlgorithm algorithm = ControllerAlgorithm::Centroid,
     float k_att = 1.5f,
     float k_rep = 5.0f,
     float d_safe = 1.0f,
@@ -103,7 +105,7 @@ class Ns3Drone {
   std::unique_ptr<UwbPosition> m_uwb_position;
   DispatchManager m_dispatcher;
 
-  Controller m_controller;
+  std::unique_ptr<ControllerInterface> m_controller;
 
   bool help_proxy_sent = false;
 

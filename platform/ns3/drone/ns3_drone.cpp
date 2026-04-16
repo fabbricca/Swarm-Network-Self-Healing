@@ -5,17 +5,18 @@
 Ns3Drone::Ns3Drone(
   uint8_t id,
   ::ns3::Ptr<::ns3::Node> node,
+  ControllerAlgorithm algorithm,
   float k_att,
   float k_rep,
   float d_safe,
   float v_max,
   float drone_weight_kg,
   double uwb_noise_std_dev_m
-) : 
+) :
   m_id(id),
   m_node(node),
   m_comm(std::make_unique<sim::UwbTransport>(node, id), id),
-  m_controller(id, k_att, k_rep, d_safe, v_max, drone_weight_kg)
+  m_controller(makeController(algorithm, id, k_att, k_rep, d_safe, v_max, drone_weight_kg))
 {
   if (!m_node) {
     return;
@@ -75,7 +76,7 @@ void Ns3Drone::startMission() {
     return;
   }
 
-  m_controller.setMissionActive(true);
+  m_controller->setMissionActive(true);
 
   m_mission_start_s = ::ns3::Simulator::Now().GetSeconds();
   m_last_mission_log_s = -1.0;
@@ -85,7 +86,7 @@ void Ns3Drone::startMission() {
 }
 
 void Ns3Drone::stopMission() {
-  m_controller.setMissionActive(false);
+  m_controller->setMissionActive(false);
 }
 
 void Ns3Drone::onTick() {
@@ -113,7 +114,7 @@ void Ns3Drone::onTick() {
   // A mission-active drone may temporarily leave base coverage while transiting toward
   // the midpoint equilibrium — this is expected overshoot, not a loss of connectivity.
   if (m_waiting_ack && (now_s - m_last_ack_rx_s) > m_ack_timeout_s
-      && !help_proxy_sent && !m_controller.isMissionActive()) {
+      && !help_proxy_sent && !m_controller->isMissionActive()) {
     sendHelpProxy();
     m_waiting_ack = false;
   }
@@ -161,7 +162,7 @@ void Ns3Drone::onTick() {
   // - If mission is off: apply a default "idle" velocity so drones move and can leave coverage.
   if (m_flood_manager && m_velocity_actuator && m_neighbor_manager && m_uwb_position) {
     m_uwb_position->retrieveCurrentPosition();
-    m_controller.step(
+    m_controller->step(
       m_flood_manager.get(),
       m_velocity_actuator.get(),
       m_neighbor_manager.get(),

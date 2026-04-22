@@ -60,3 +60,5 @@ _deps
 
 # Temp files
 tmp/*
+
+output/

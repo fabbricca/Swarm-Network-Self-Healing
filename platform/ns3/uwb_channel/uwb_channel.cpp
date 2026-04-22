@@ -27,6 +27,12 @@ void UwbChannel::Transmit(uint8_t src_id, const std::vector<uint8_t>& bytes) {
     return;
   }
 
+  // One radio TX burst regardless of how many receivers overhear it.
+  auto& e = src_it->second.energy;
+  e.tx_count++;
+  e.tx_bytes += bytes.size();
+  e.tx_active_s += Dwm1000EnergyParams::frameDuration(bytes.size());
+
   auto bytes_copy = std::make_shared<std::vector<uint8_t>>(bytes);
 
   for (const auto& [id, ep] : m_endpoints) {
@@ -43,6 +49,11 @@ void UwbChannel::TransmitTo(uint8_t src_id, uint8_t dst_id, const std::vector<ui
   if (src_it == m_endpoints.end() || dst_it == m_endpoints.end()) {
     return;
   }
+
+  auto& e = src_it->second.energy;
+  e.tx_count++;
+  e.tx_bytes += bytes.size();
+  e.tx_active_s += Dwm1000EnergyParams::frameDuration(bytes.size());
 
   auto bytes_copy = std::make_shared<std::vector<uint8_t>>(bytes);
   ScheduleDelivery(src_it->second, dst_it->second, bytes_copy);
@@ -71,8 +82,19 @@ void UwbChannel::ScheduleDelivery(const Endpoint& src, const Endpoint& dst,
 void UwbChannel::Deliver(uint8_t dst_id, std::shared_ptr<std::vector<uint8_t>> bytes) {
   auto it = m_endpoints.find(dst_id);
   if (it != m_endpoints.end() && it->second.rx_callback) {
+    auto& e = it->second.energy;
+    e.rx_count++;
+    e.rx_bytes += bytes->size();
+    e.rx_active_s += Dwm1000EnergyParams::frameDuration(bytes->size());
+
     it->second.rx_callback(*bytes);
   }
+}
+
+const EnergyStats& UwbChannel::GetEnergyStats(uint8_t id) const {
+  static const EnergyStats empty;
+  auto it = m_endpoints.find(id);
+  return (it != m_endpoints.end()) ? it->second.energy : empty;
 }
 
 }  // namespace sim

@@ -10,8 +10,19 @@
 #include "ns3/mobility-module.h"
 
 #include "platform/ns3/uwb_channel/uwb_channel_config.h"
+#include "platform/ns3/uwb_channel/uwb_energy_params.h"
 
 namespace sim {
+
+// Per-node packet and energy accounting.
+struct EnergyStats {
+  uint32_t tx_count    = 0;
+  uint32_t rx_count    = 0;
+  uint64_t tx_bytes    = 0;
+  uint64_t rx_bytes    = 0;
+  double   tx_active_s = 0.0;
+  double   rx_active_s = 0.0;
+};
 
 // Direct PHY-level UWB channel — no MAC, no IP.
 //
@@ -41,6 +52,8 @@ class UwbChannel {
 
   double MaxRange() const { return m_cfg.maxRangeMeters; }
 
+  const EnergyStats& GetEnergyStats(uint8_t id) const;
+
  private:
   UwbChannel();
 
@@ -48,6 +61,7 @@ class UwbChannel {
     uint8_t id;
     ::ns3::Ptr<::ns3::Node> node;
     RxCallback rx_callback;
+    EnergyStats energy;
   };
 
   // Deliver a frame to a destination endpoint after propagation delay.

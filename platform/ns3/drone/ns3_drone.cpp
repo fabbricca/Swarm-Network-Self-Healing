@@ -40,6 +40,24 @@ Ns3Drone::Ns3Drone(
     299792458.0, uwb_noise_std_dev_m);
   m_uwb_position = std::make_unique<UwbPosition>(m_uwb_ranging_manager.get());
 
+  // Seed the trilat estimate with spawn xy (and z=0).  Models an onboard
+  // GPS/barometer snapshot at boot so drones that never achieve a 3-anchor
+  // UWB fix don't report (0,0,0) forever (scenario coverage gaps like
+  // far-corner drones can see only 1–2 anchors).
+  //
+  // We deliberately seed z=0 rather than spawn z.  When anchors are
+  // effectively coplanar (our scenarios place them on short posts at
+  // z ≈ 2–5 m), 2D trilat cannot update z — so whatever z the seed picks
+  // is the z everyone uses forever.  Seeding spawn z creates an
+  // open-loop integrator: the controller drives physical z toward
+  // perceived-neighbor-z (including the base at z=0), but perceived self-z
+  // never follows, so drones pile 50+ m into the ground chasing a target
+  // they never seem to reach.  Seeding z=0 uniformly zeroes out all
+  // z-deltas in the force model and leaves physical z at its spawn value.
+  const ::ns3::Vector spawn = mobility->GetPosition();
+  m_uwb_ranging_manager->seedEstimatedPosition(spawn.x, spawn.y, 0.0);
+  m_uwb_position->retrieveCurrentPosition();
+
   m_dispatcher.setFloodManager(m_flood_manager.get());
   m_dispatcher.setNeighborManager(m_neighbor_manager.get());
   m_dispatcher.setUwbRangingManager(m_uwb_ranging_manager.get());
@@ -89,7 +107,40 @@ void Ns3Drone::stopMission() {
   m_controller->setMissionActive(false);
 }
 
+void Ns3Drone::kill() {
+  if (!m_alive) return;
+  m_alive = false;
+  m_killed_at_s = ::ns3::Simulator::Now().GetSeconds();
+
+  // Snapshot the exact kill position so currentGtPos() returns the frozen
+  // spot (otherwise we'd report the last sample from up to m_tick_dt_s ago).
+  if (auto mob = m_node ? m_node->GetObject<::ns3::ConstantPositionMobilityModel>() : nullptr) {
+    const ::ns3::Vector p = mob->GetPosition();
+    m_prev_gt_x = p.x;
+    m_prev_gt_y = p.y;
+    m_prev_gt_z = p.z;
+  }
+
+  if (m_velocity_actuator) {
+    m_velocity_actuator->brake();
+  }
+  if (m_controller) {
+    m_controller->setMissionActive(false);
+    m_controller->setReturning(false);
+    m_controller->setStationKeeping(false);
+  }
+
+  std::cout << "[KILL] t=" << m_killed_at_s << "s drone=" << static_cast<int>(m_id)
+            << " pos=(" << m_prev_gt_x << "," << m_prev_gt_y << "," << m_prev_gt_z
+            << ")" << std::endl;
+}
+
 void Ns3Drone::onTick() {
+  // Dead drones: stop sampling, stop transmitting, and don't re-schedule —
+  // the tick chain ends, saving event-queue work for the rest of the sim.
+  if (!m_alive) {
+    return;
+  }
   const double now_s = ::ns3::Simulator::Now().GetSeconds();
 
   // Ground-truth distance accumulation.  We sample the mobility model (not the
@@ -102,12 +153,28 @@ void Ns3Drone::onTick() {
       const double dx = p.x - m_prev_gt_x;
       const double dy = p.y - m_prev_gt_y;
       const double dz = p.z - m_prev_gt_z;
-      m_total_distance_m += std::sqrt(dx * dx + dy * dy + dz * dz);
+      const double step = std::sqrt(dx * dx + dy * dy + dz * dz);
+      m_total_distance_m += step;
+      if (m_returning) {
+        m_return_phase_distance_m += step;
+      }
     }
     m_prev_gt_x = p.x;
     m_prev_gt_y = p.y;
     m_prev_gt_z = p.z;
     m_has_prev_gt_pos = true;
+
+    // Station-keeping drift: how far we've wandered from the position where
+    // we first entered station-keeping.  Reset to 0 on entry (below).
+    if (m_station_keeping) {
+      const double dxr = p.x - m_station_keeping_ref_pos_gt.x;
+      const double dyr = p.y - m_station_keeping_ref_pos_gt.y;
+      const double dzr = p.z - m_station_keeping_ref_pos_gt.z;
+      const double drift = std::sqrt(dxr * dxr + dyr * dyr + dzr * dzr);
+      if (drift > m_station_keeping_max_drift_m) {
+        m_station_keeping_max_drift_m = drift;
+      }
+    }
   }
 
   // Only emit HELP_PROXY if this drone is NOT already repositioning as a relay helper.
@@ -119,7 +186,92 @@ void Ns3Drone::onTick() {
     m_waiting_ack = false;
   }
 
-  // Post-mission debug: log how drones reposition 
+  // Platoon return: check if it's time to start returning (only the first
+  // time — m_return_start_s latches on first trigger, so this block does not
+  // re-fire after station-keeping.  Legitimate re-loss is handled by the
+  // safety re-arm block below, which does not touch m_return_start_s.)
+  if (help_proxy_sent && m_return_triggered && !m_returning && m_return_start_s < 0.0) {
+    const bool timeout_expired = (now_s - m_return_trigger_time_s) >= m_return_timeout_s;
+
+    // Start returning if:
+    // (a) timeout expired (safety net — covers packet loss and tail nodes), OR
+    // (b) we received a RETURNING flag from a downstream (higher-hop) drone
+    if (timeout_expired || m_return_flag_received) {
+      m_returning = true;
+      m_return_start_s = now_s;
+      m_return_trigger_was_flag = !timeout_expired;
+      m_controller->setReturning(true);
+
+      // Snapshot the ground-truth position where the return phase starts and
+      // reset path accumulator — the return-quality metric compares the path
+      // length travelled during return vs. the straight-line distance.
+      m_return_start_pos_gt = Vector3D(m_prev_gt_x, m_prev_gt_y, m_prev_gt_z);
+      m_return_phase_distance_m = 0.0;
+
+      // Broadcast our own RETURNING flag so upstream drones can start
+      const uint8_t my_hops = m_flood_manager ? m_flood_manager->getHopsFromBase() : UINT8_MAX;
+      ReturningMsg ret;
+      ret.drone_id = m_id;
+      ret.hop_count = my_hops;
+
+      ::Packet out;
+      out.type = ::PacketType::CORE;
+      out.src = m_id;
+      out.dst = BROADCAST_ID;
+      out.payload.resize(sizeof(ret));
+      std::memcpy(out.payload.data(), &ret, sizeof(ret));
+      m_comm.send(out);
+
+      std::cout << "[RETURNING] t=" << now_s << "s drone=" << static_cast<int>(m_id)
+                << " hops=" << static_cast<int>(my_hops)
+                << " trigger=" << (timeout_expired ? "timeout" : "flag") << std::endl;
+    }
+  }
+
+  // Exit returning mode: back in direct base coverage.  Use direct-ACK
+  // reception (tracked independently of m_last_ack_rx_s) rather than the
+  // flood-based hops value, which lags by a full flood round.  On entry
+  // we brake explicitly and enter station-keeping so the controller holds
+  // position instead of coasting.
+  if (m_returning && hasDirectBaseCoverage()) {
+    m_returning = false;
+    m_return_complete_s = now_s;
+    m_station_keeping = true;
+    m_controller->setReturning(false);
+    m_controller->setStationKeeping(true);
+    if (m_velocity_actuator) {
+      m_velocity_actuator->brake();
+    }
+
+    // Snapshot ground-truth position where the return phase ended.  This is
+    // both the end-point for return-path-efficiency/boundary metrics and the
+    // reference for station-keeping drift.
+    m_return_complete_pos_gt = Vector3D(m_prev_gt_x, m_prev_gt_y, m_prev_gt_z);
+    m_station_keeping_ref_pos_gt = m_return_complete_pos_gt;
+    m_station_keeping_max_drift_m = 0.0;
+
+    std::cout << "[RETURN_COMPLETE] t=" << now_s << "s drone=" << static_cast<int>(m_id) << std::endl;
+  }
+
+  // Safety re-arm: if we've been station-keeping but fell out of direct
+  // coverage for longer than 2 * DIRECT_ACK_TIMEOUT_S, treat it as a
+  // re-loss and go back to return mode.
+  if (m_station_keeping && !hasDirectBaseCoverage()) {
+    const double since = (m_last_direct_ack_rx_s < 0.0)
+      ? 1e9
+      : (now_s - m_last_direct_ack_rx_s);
+    if (since > 2.0 * DIRECT_ACK_TIMEOUT_S) {
+      m_station_keeping = false;
+      m_returning = true;
+      m_rearm_count += 1;
+      m_controller->setStationKeeping(false);
+      m_controller->setReturning(true);
+      std::cout << "[RETURN_REARM] t=" << now_s << "s drone=" << static_cast<int>(m_id)
+                << " lost direct coverage after " << since << "s" << std::endl;
+    }
+  }
+
+  // Post-mission debug: log how drones reposition
   if (m_mission_start_s >= 0.0) {
     if (m_last_mission_log_s < 0.0 || (now_s - m_last_mission_log_s) >= m_mission_log_dt_s) {
       if (m_uwb_position) {
@@ -178,6 +330,9 @@ void Ns3Drone::onTick() {
 }
 
 void Ns3Drone::dispatchPacket(const ::Packet& pkt) {
+  if (!m_alive) {
+    return;  // Dead drones drop all incoming packets — no state changes, no relays.
+  }
   if (pkt.payload.empty()) {
     return;
   }
@@ -226,12 +381,29 @@ void Ns3Drone::handleCorePacket(const ::Packet& pkt) {
         relayed.insert(ack.seq);
         ::Packet relay_pkt;
         relay_pkt.type = ::PacketType::CORE;
-        relay_pkt.src = pkt.src;  // keep original sender
+        // Set src to this relayer so downstream drones can distinguish
+        // direct ACKs (pkt.src == ack.base_id) from relayed ones.
+        relay_pkt.src = m_id;
         relay_pkt.dst = BROADCAST_ID;
         relay_pkt.payload.resize(sizeof(ack));
         std::memcpy(relay_pkt.payload.data(), &ack, sizeof(ack));
         m_comm.send(relay_pkt);
         return;
+      }
+
+      // Distinguish direct ACKs (arrived straight from base) from relayed
+      // ones (the relayer sets pkt.src to its own id above).  Direct ACKs
+      // refresh m_last_direct_ack_rx_s unconditionally — that timestamp is
+      // what hasDirectBaseCoverage() / the station-keeping trigger consult.
+      const bool is_direct = (pkt.src == ack.base_id);
+      if (is_direct) {
+        m_last_direct_ack_rx_s = ::ns3::Simulator::Now().GetSeconds();
+      }
+
+      // Healing-latency metric: first ACK addressed to us after our HELP_PROXY
+      // marks the moment the relay chain is operational end-to-end.
+      if (help_proxy_sent && m_first_ack_after_help_s < 0.0) {
+        m_first_ack_after_help_s = ::ns3::Simulator::Now().GetSeconds();
       }
 
       // Don't update m_last_ack_rx_s if we've sent HELP_PROXY - we've lost direct
@@ -241,28 +413,48 @@ void Ns3Drone::handleCorePacket(const ::Packet& pkt) {
         m_last_ack_rx_s = ::ns3::Simulator::Now().GetSeconds();
       } else {
         // Log when the lost drone receives a relayed ACK
-        std::cout << "[RELAYED_ACK_RX] t=" << ::ns3::Simulator::Now().GetSeconds() 
+        std::cout << "[RELAYED_ACK_RX] t=" << ::ns3::Simulator::Now().GetSeconds()
                   << "s drone=" << static_cast<int>(m_id)
                   << " seq=" << ack.seq << std::endl;
+
+        // First relayed ACK with a valid hop count confirms the relay chain
+        // is operational.  Don't arm if hops are still unknown (UINT8_MAX) —
+        // the flood table hasn't converged yet and we'd compute timeout=0.
+        const uint8_t hops = m_flood_manager ? m_flood_manager->getHopsFromBase() : UINT8_MAX;
+        if (!m_return_triggered && hops != UINT8_MAX) {
+          m_return_triggered = true;
+          m_return_trigger_time_s = ::ns3::Simulator::Now().GetSeconds();
+          m_return_timeout_s = static_cast<double>(MAX_CHAIN_HOPS - std::min(hops, MAX_CHAIN_HOPS)) * RETURN_DELTA_S;
+
+          std::cout << "[RETURN_ARMED] t=" << m_return_trigger_time_s
+                    << "s drone=" << static_cast<int>(m_id)
+                    << " hops=" << static_cast<int>(hops)
+                    << " timeout=" << m_return_timeout_s << "s" << std::endl;
+        }
       }
       m_last_acked_seq = ack.seq;
       m_waiting_ack = false;
 
-      // Treat the base station as a regular neighbor entry.
-      // We translate the ACK's embedded base info into the same payload format used
-      // by NeighborManager broadcasts: [id][hops][double coords...].
-      if (m_neighbor_manager) {
+      // Treat the base station as a regular neighbor entry — but ONLY
+      // on direct ACKs.  Synthesizing this from relayed ACKs plants a
+      // (0,0,0)/hops=0 attractor in the neighbor table of lost drones,
+      // which then pulls them all the way to the origin during return
+      // mode instead of letting them stop at the coverage boundary.
+      // Payload format matches NeighborManager broadcasts:
+      // [id][hops][flags][double coords...].
+      if (is_direct && m_neighbor_manager) {
         ::Packet base_as_neighbor;
         base_as_neighbor.type = ::PacketType::NEIGHBOR;
         base_as_neighbor.src = ack.base_id;
         base_as_neighbor.dst = m_id;
 
-        base_as_neighbor.payload.resize(2 + 3 * sizeof(double));
+        base_as_neighbor.payload.resize(3 + 3 * sizeof(double));
         base_as_neighbor.payload[0] = ack.base_id;
         base_as_neighbor.payload[1] = ack.base_hops_to_base_station;
+        base_as_neighbor.payload[2] = 0;  // flags: base is never "returning"
 
         const double base_coords[3] = {ack.x, ack.y, ack.z};
-        std::memcpy(base_as_neighbor.payload.data() + 2, base_coords, sizeof(base_coords));
+        std::memcpy(base_as_neighbor.payload.data() + 3, base_coords, sizeof(base_coords));
 
         m_neighbor_manager->onPacketReceived(base_as_neighbor);
       }
@@ -316,6 +508,38 @@ void Ns3Drone::handleCorePacket(const ::Packet& pkt) {
           std::memcpy(relay.payload.data(), &msg, sizeof(msg));
           m_comm.send(relay);
         }
+      }
+      return;
+    }
+
+    case SimMsgType::RETURNING: {
+      if (pkt.payload.size() < sizeof(ReturningMsg)) return;
+      ReturningMsg msg;
+      std::memcpy(&msg, pkt.payload.data(), sizeof(msg));
+
+      if (msg.drone_id == m_id) return;  // ignore our own
+
+      // Only act on flags from the immediate next-hop neighbor (hop x+1),
+      // not from arbitrary higher-hop drones further down the chain.
+      const uint8_t my_hops = m_flood_manager ? m_flood_manager->getHopsFromBase() : UINT8_MAX;
+      if (msg.hop_count == my_hops + 1 && m_return_triggered && !m_returning && !m_return_flag_received) {
+        m_return_flag_received = true;
+        std::cout << "[RETURN_FLAG_RX] t=" << ::ns3::Simulator::Now().GetSeconds()
+                  << "s drone=" << static_cast<int>(m_id)
+                  << " from=" << static_cast<int>(msg.drone_id)
+                  << " (hop " << static_cast<int>(msg.hop_count) << ")" << std::endl;
+      }
+
+      // Relay the flag upstream (dedup by drone_id)
+      if (!m_relayed_returning.count(msg.drone_id)) {
+        m_relayed_returning.insert(msg.drone_id);
+        ::Packet relay;
+        relay.type = ::PacketType::CORE;
+        relay.src = m_id;
+        relay.dst = BROADCAST_ID;
+        relay.payload.resize(sizeof(msg));
+        std::memcpy(relay.payload.data(), &msg, sizeof(msg));
+        m_comm.send(relay);
       }
       return;
     }
@@ -470,4 +694,12 @@ bool Ns3Drone::isBaseReachable() const {
 
   const double now_s = ::ns3::Simulator::Now().GetSeconds();
   return (now_s - m_last_ack_rx_s) <= m_ack_timeout_s;
+}
+
+bool Ns3Drone::hasDirectBaseCoverage() const {
+  if (m_last_direct_ack_rx_s < 0.0) {
+    return false;
+  }
+  const double now_s = ::ns3::Simulator::Now().GetSeconds();
+  return (now_s - m_last_direct_ack_rx_s) <= DIRECT_ACK_TIMEOUT_S;
 }

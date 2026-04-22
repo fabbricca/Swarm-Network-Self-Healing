@@ -17,11 +17,23 @@ class NeighborManager : public NeighborManagerInterface {
 
   void onPacketReceived(const ::Packet& pkt) override;
   std::vector<NeighborInfoInterface*> getNeighbors() const override;
-  void sendToNeighbors(uint8_t id, PositionInterface* position, uint8_t hops_to_base_station) override;
+  void sendToNeighbors(uint8_t id, PositionInterface* position, uint8_t hops_to_base_station, bool returning) override;
 
  private:
+  struct Entry {
+    std::unique_ptr<NeighborInfo> info;
+    uint32_t last_seen_call;
+  };
+
   CommunicationManagerInterface* m_communication_manager;
-  std::unordered_map<uint8_t, std::unique_ptr<NeighborInfo>> m_neighbors;
+  mutable std::unordered_map<uint8_t, Entry> m_neighbors;
+
+  // Neighbors broadcast at up to MAX_CALLS_BETWEEN_SENDS (~2 s at 20 Hz)
+  // heartbeat.  Evict entries not refreshed within STALE_CALLS (~3 s) so a
+  // drone that has drifted out of RF range stops dragging a stale entry
+  // through the controller's potential field.  Without this, cached
+  // lower-hop neighbors keep pulling a lost drone past the relay chain.
+  static constexpr uint32_t STALE_CALLS = 60;
 
   // Rate-limit NEIGHBOR broadcasts.  The controller invokes sendToNeighbors
   // every physics tick (20 Hz); we count invocations rather than reading a

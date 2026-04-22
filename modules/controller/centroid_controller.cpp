@@ -11,8 +11,13 @@ void CentroidController::accumulateAttractive(
     // Group different-hop neighbors by hop count so each hop level contributes
     // a single attraction toward its centroid — stops N drones at one hop
     // from pulling N times harder than a single drone on the other side.
+    // Skip drones currently returning: they are not valid formation anchors
+    // (they are actively retreating toward base).  Collision-avoid repulsion
+    // is applied in ControllerBase::step(), so they are still respected for
+    // safety.
     std::unordered_map<uint8_t, std::vector<std::vector<double>>> hop_groups;
     for (const NeighborInfoInterface* neighbor : neighbors) {
+        if (neighbor->getIsReturning()) continue;
         const uint8_t nh = neighbor->getHopsToBaseStation();
         if (nh != self_hops) {
             hop_groups[nh].push_back(neighbor->getPosition());

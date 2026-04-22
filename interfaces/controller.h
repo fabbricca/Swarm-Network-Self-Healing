@@ -13,6 +13,10 @@ class ControllerInterface {
 
         virtual void setMissionActive(bool active) = 0;
         virtual bool isMissionActive() const = 0;
+        virtual void setReturning(bool returning) = 0;
+        virtual bool isReturning() const = 0;
+        virtual void setStationKeeping(bool station_keeping) = 0;
+        virtual bool isStationKeeping() const = 0;
         virtual void setIdleVelocity(const Vector3D& velocity) = 0;
 
         virtual void step(

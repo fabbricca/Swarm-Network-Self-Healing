@@ -21,6 +21,7 @@
 
 #include "common/messages.h"
 #include "common/packet.h"
+#include "common/vector3D.h"
 
 #include "ns3/core-module.h"
 #include "ns3/constant-position-mobility-model.h"
@@ -78,6 +79,32 @@ class Ns3Drone {
     return m_flood_manager ? m_flood_manager->getHopsFromBase() : 0xFF;
   }
 
+  // Return-behavior telemetry (all negative => event never occurred).
+  double helpProxyTxTime() const { return m_last_help_proxy_tx_s; }
+  double returnArmedTime() const { return m_return_trigger_time_s; }
+  double returnStartTime() const { return m_return_start_s; }
+  double returnCompleteTime() const { return m_return_complete_s; }
+  bool returnTriggerWasFlag() const { return m_return_trigger_was_flag; }
+  bool isReturning() const { return m_returning; }
+  bool returnArmed() const { return m_return_triggered; }
+
+  // Metrics telemetry for end-of-sim report.
+  double   firstAckAfterHelpS()   const { return m_first_ack_after_help_s; }
+  double   returnPhaseDistanceM() const { return m_return_phase_distance_m; }
+  uint32_t rearmCount()           const { return m_rearm_count; }
+  double   stationKeepingDriftM() const { return m_station_keeping_max_drift_m; }
+  Vector3D returnStartPosGt()     const { return m_return_start_pos_gt; }
+  Vector3D returnCompletePosGt()  const { return m_return_complete_pos_gt; }
+  Vector3D currentGtPos() const {
+    return Vector3D(m_prev_gt_x, m_prev_gt_y, m_prev_gt_z);
+  }
+
+  // Mid-sim scheduled failure: freezes the drone in place, stops all TX/RX,
+  // and bypasses controller state.  One-shot — no revive path.
+  void   kill();
+  bool   isAlive() const { return m_alive; }
+  double killedAtS() const { return m_killed_at_s; }
+
  private:
   void onTick();
   void dispatchPacket(const ::Packet& pkt);
@@ -87,6 +114,7 @@ class Ns3Drone {
   void sendHelpProxy();
 
   bool isBaseReachable() const;
+  bool hasDirectBaseCoverage() const;
 
   uint8_t m_id;
   ::ns3::Ptr<::ns3::Node> m_node;
@@ -129,6 +157,17 @@ class Ns3Drone {
   double m_ack_timeout_s = 1.5;
   double m_last_ack_rx_s = 0.0;
   bool m_waiting_ack = false;
+
+  // Direct-coverage tracking: refreshed only by POS_ACKs received directly
+  // from the base (pkt.src == ack.base_id).  This bypasses the help-proxy
+  // freeze on m_last_ack_rx_s so we can tell when a returning drone has
+  // re-entered the base's radio cell.
+  double m_last_direct_ack_rx_s = -1.0;
+  static constexpr double DIRECT_ACK_TIMEOUT_S = 1.5;
+
+  // Station-keeping: active once we complete the return and sit at the
+  // coverage boundary.  Controller short-circuits to brake().
+  bool m_station_keeping = false;
 
   uint16_t m_pos_seq = 0;
   uint16_t m_last_acked_seq = 0;
@@ -173,4 +212,40 @@ class Ns3Drone {
   // HELP_PROXY relay: lost drones relay other lost drones' HELP_PROXY upstream
   // so in-coverage drones discover all nodes in the chain.
   std::unordered_set<uint8_t> m_relayed_help_proxy;
+
+  // ── Platoon-based returning mode ──
+  bool m_returning = false;              // true once this lost drone starts moving back
+  bool m_return_triggered = false;       // true once first relayed ACK received (chain exists)
+  double m_return_trigger_time_s = -1.0; // when the first relayed ACK arrived
+  double m_return_timeout_s = -1.0;      // computed: (MAX_CHAIN_HOPS - my_hops) * RETURN_DELTA_S
+  bool m_return_flag_received = false;   // true if a downstream RETURNING flag was received
+  double m_return_start_s = -1.0;        // when this drone actually started moving back
+  double m_return_complete_s = -1.0;     // when this drone reached hop 1
+  bool m_return_trigger_was_flag = false; // true if return triggered by flag, false if by timeout
+
+  // Dedup: only relay each drone's RETURNING flag once
+  std::unordered_set<uint8_t> m_relayed_returning;
+
+  // Tuning constants
+  static constexpr double RETURN_DELTA_S = 1.0;     // timeout gap per hop level
+  static constexpr uint8_t MAX_CHAIN_HOPS = 10;     // upper bound for timeout calc
+  static constexpr float RETURN_K_ATT_SCALE = 0.3f; // reduced attraction gain for returning
+
+  // ── End-of-sim metrics telemetry ──
+  // Healing-latency: first ACK addressed to us received after help_proxy_sent.
+  double m_first_ack_after_help_s = -1.0;
+
+  // Return-quality: ground-truth snapshots + path-length accumulation.
+  Vector3D m_return_start_pos_gt{0.0, 0.0, 0.0};
+  Vector3D m_return_complete_pos_gt{0.0, 0.0, 0.0};
+  double   m_return_phase_distance_m = 0.0;
+  uint32_t m_rearm_count = 0;
+
+  // Post-return stability: drift from the position captured at station-keeping entry.
+  Vector3D m_station_keeping_ref_pos_gt{0.0, 0.0, 0.0};
+  double   m_station_keeping_max_drift_m = 0.0;
+
+  // Mid-sim failure.
+  bool   m_alive = true;
+  double m_killed_at_s = -1.0;
 };

@@ -10,11 +10,11 @@ void NeighborManager::onPacketReceived(const ::Packet& pkt) {
     if (pkt.type != ::PacketType::NEIGHBOR) {
         return;
     }
-    if (pkt.payload.size() < 2) {
+    if (pkt.payload.size() < 3) {
         return;
     }
 
-    // Payload format: [neighbor_id][hops][double coords...]
+    // Payload format: [neighbor_id][hops][flags][double coords...]
     const uint8_t neighbor_id = pkt.payload[0];
     if (neighbor_id != pkt.src) {
         // Basic sanity check: outer header src should match payload id.
@@ -22,7 +22,9 @@ void NeighborManager::onPacketReceived(const ::Packet& pkt) {
     }
 
     const uint8_t hops = pkt.payload[1];
-    const size_t coord_bytes = pkt.payload.size() - 2;
+    const uint8_t flags = pkt.payload[2];
+    const bool returning = (flags & NeighborInfo::FLAG_RETURNING) != 0;
+    const size_t coord_bytes = pkt.payload.size() - 3;
     if (coord_bytes % sizeof(double) != 0) {
         return;
     }
@@ -30,17 +32,32 @@ void NeighborManager::onPacketReceived(const ::Packet& pkt) {
     std::vector<double> coords;
     coords.resize(coord_bytes / sizeof(double));
     if (coord_bytes > 0) {
-        std::memcpy(coords.data(), pkt.payload.data() + 2, coord_bytes);
+        std::memcpy(coords.data(), pkt.payload.data() + 3, coord_bytes);
     }
 
-    m_neighbors[neighbor_id] = std::make_unique<NeighborInfo>(neighbor_id, hops, coords);
+    auto& entry = m_neighbors[neighbor_id];
+    entry.info = std::make_unique<NeighborInfo>(neighbor_id, hops, returning, coords);
+    entry.last_seen_call = m_call_count;
 }
- 
+
 std::vector<NeighborInfoInterface*> NeighborManager::getNeighbors() const {
+    // Evict entries not refreshed within STALE_CALLS ticks.  This keeps a
+    // drone that has drifted out of RF range from anchoring the controller
+    // to a stale cached position (pre-TTL, a lost drone would keep pulling
+    // toward cached helpers forever, coasting past the relay chain).
+    for (auto it = m_neighbors.begin(); it != m_neighbors.end(); ) {
+        const uint32_t age = m_call_count - it->second.last_seen_call;
+        if (age > STALE_CALLS) {
+            it = m_neighbors.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
     std::vector<NeighborInfoInterface*> neighbors;
     neighbors.reserve(m_neighbors.size());
     for (const auto& kv : m_neighbors) {
-        neighbors.push_back(kv.second.get());
+        neighbors.push_back(kv.second.info.get());
     }
     return neighbors;
 }
@@ -48,7 +65,8 @@ std::vector<NeighborInfoInterface*> NeighborManager::getNeighbors() const {
 void NeighborManager::sendToNeighbors(
     uint8_t id,
     PositionInterface* position,
-    uint8_t hops_to_base_station
+    uint8_t hops_to_base_station,
+    bool returning
 ) {
     if (!m_communication_manager || !position) {
         return;
@@ -77,7 +95,7 @@ void NeighborManager::sendToNeighbors(
         }
     }
 
-    NeighborInfo info(id, hops_to_base_station, coords);
+    NeighborInfo info(id, hops_to_base_station, returning, coords);
 
     ::Packet pkt;
     pkt.type = ::PacketType::NEIGHBOR;

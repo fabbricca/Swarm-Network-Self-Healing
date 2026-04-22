@@ -29,6 +29,10 @@ class ControllerBase : public ControllerInterface {
 
         void setMissionActive(bool active) override;
         bool isMissionActive() const override;
+        void setReturning(bool returning) override;
+        bool isReturning() const override;
+        void setStationKeeping(bool station_keeping) override;
+        bool isStationKeeping() const override;
         void setIdleVelocity(const Vector3D& velocity) override;
 
         void step(
@@ -63,5 +67,9 @@ class ControllerBase : public ControllerInterface {
         void computeVelocityCommand(const Vector3D& force, Vector3D* new_acceleration);
 
         bool mission_active = false;
+        bool m_returning = false;
+        bool m_station_keeping = false;
         Vector3D idle_velocity{0.5f, 0.0f, 0.0f};
+
+        static constexpr float RETURN_K_ATT_SCALE = 0.3f;
 };

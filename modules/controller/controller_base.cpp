@@ -26,6 +26,22 @@ bool ControllerBase::isMissionActive() const {
     return mission_active;
 }
 
+void ControllerBase::setReturning(bool returning) {
+    m_returning = returning;
+}
+
+bool ControllerBase::isReturning() const {
+    return m_returning;
+}
+
+void ControllerBase::setStationKeeping(bool station_keeping) {
+    m_station_keeping = station_keeping;
+}
+
+bool ControllerBase::isStationKeeping() const {
+    return m_station_keeping;
+}
+
 void ControllerBase::setIdleVelocity(const Vector3D& velocity) {
     idle_velocity = velocity;
 }
@@ -60,9 +76,67 @@ void ControllerBase::step(
     if (!flooding_manager || !neighbor_manager || !position) {
         return;
     }
+
+    // Station-keeping short-circuit: a returned drone sits at the coverage
+    // boundary, brakes explicitly, and keeps advertising as a normal anchor
+    // so helpers can re-anchor against it.
+    if (m_station_keeping) {
+        velocity_actuator->brake();
+        position->retrieveCurrentPosition();
+        const uint8_t hops = flooding_manager->getHopsFromBase();
+        neighbor_manager->sendToNeighbors(self_id, position, hops, /*returning=*/false);
+        return;
+    }
+
+    if (!mission_active && m_returning) {
+        // Returning mode: attract toward lower-hop neighbors only, reduced gain.
+        // This follows the relay chain gradient back toward base.
+        const auto neighbors = neighbor_manager->getNeighbors();
+        position->retrieveCurrentPosition();
+        const uint8_t my_hops = flooding_manager->getHopsFromBase();
+
+        Vector3D F_tot{0.0f, 0.0f, 0.0f};
+        bool has_attractor = false;
+        for (const NeighborInfoInterface* neighbor : neighbors) {
+            Vector3D diff = position->distanceFromCoords(neighbor->getPosition());
+            const uint8_t nh = neighbor->getHopsToBaseStation();
+
+            if (nh < my_hops) {
+                // Attraction toward lower-hop neighbors (toward base)
+                F_tot = F_tot + (K_att * RETURN_K_ATT_SCALE * diff);
+                has_attractor = true;
+            }
+            // Repulsion from all neighbors (collision avoidance)
+            if (diff.module() < D_safe) {
+                computeRepulsiveForces(diff, F_tot);
+            }
+        }
+
+        // Safety brake: with no lower-hop neighbor visible, we have no gradient
+        // to follow.  Without an explicit brake, applyVelocity(a=0) leaves the
+        // previous velocity intact and the drone coasts off into the distance
+        // indefinitely (it may have just passed through the relay chain and
+        // lost coverage).  Stop and wait for the chain to catch up instead.
+        if (!has_attractor) {
+            velocity_actuator->brake();
+            neighbor_manager->sendToNeighbors(self_id, position, my_hops, /*returning=*/true);
+            return;
+        }
+
+        Vector3D new_acceleration(0.0, 0.0, 0.0);
+        computeVelocityCommand(F_tot, &new_acceleration);
+        velocity_actuator->applyVelocity(new_acceleration, V_max);
+
+        // Keep advertising — with returning=true so helpers drop us from
+        // their attractive centroid (but keep collision avoidance).
+        neighbor_manager->sendToNeighbors(self_id, position, my_hops, /*returning=*/true);
+        return;
+    }
+
     if (!mission_active) {
-        Vector3D idle_acceleration{0, 0, 0};
-        velocity_actuator->applyVelocity(idle_acceleration, V_max);
+        // Brake explicitly so the drone holds position — applying a zero
+        // acceleration only zeroes acceleration, not velocity.
+        velocity_actuator->brake();
 
         // Silence NEIGHBOR only when we're in base coverage (hops==1): an
         // in-coverage idle drone plays no role in the formation task and
@@ -71,7 +145,7 @@ void ControllerBase::step(
         const uint8_t hops = flooding_manager->getHopsFromBase();
         if (hops != 1) {
             position->retrieveCurrentPosition();
-            neighbor_manager->sendToNeighbors(self_id, position, hops);
+            neighbor_manager->sendToNeighbors(self_id, position, hops, /*returning=*/false);
         }
         return;
     }
@@ -90,6 +164,23 @@ void ControllerBase::step(
         }
     }
 
+    // Safety brake: if we have no neighbors, or the accumulated force is
+    // essentially zero (e.g. weighted controller where one hop-side vanished
+    // so the cross-product weight collapses to 0), applyVelocity(a=0)
+    // preserves the previous velocity and the drone coasts at V_max
+    // indefinitely until the sim ends — taking it 100s of meters out of
+    // formation and blowing up trilateration.  Brake instead.
+    if (neighbors.empty() || F_tot.module() < 1e-6f) {
+        velocity_actuator->brake();
+        neighbor_manager->sendToNeighbors(
+            self_id,
+            position,
+            hops_from_base_station,
+            /*returning=*/false
+        );
+        return;
+    }
+
     Vector3D new_acceleration(0.0, 0.0, 0.0);
     computeVelocityCommand(F_tot, &new_acceleration);
     velocity_actuator->applyVelocity(new_acceleration, V_max);
@@ -97,6 +188,7 @@ void ControllerBase::step(
     neighbor_manager->sendToNeighbors(
         self_id,
         position,
-        hops_from_base_station
+        hops_from_base_station,
+        /*returning=*/false
     );
 }

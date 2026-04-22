@@ -13,14 +13,17 @@ void WeightedController::accumulateAttractive(
     // N times harder than a single base, shifting the equilibrium off the
     // midpoint.  In the common case N_lower=1 this reduces to "weigh the
     // base as many times as the higher-hop drones heard".
+    // Skip drones currently returning: they are not valid formation anchors.
     uint32_t n_lower = 0, n_higher = 0;
     for (const NeighborInfoInterface* neighbor : neighbors) {
+        if (neighbor->getIsReturning()) continue;
         const uint8_t nh = neighbor->getHopsToBaseStation();
         if (nh < self_hops)      ++n_lower;
         else if (nh > self_hops) ++n_higher;
     }
 
     for (const NeighborInfoInterface* neighbor : neighbors) {
+        if (neighbor->getIsReturning()) continue;
         const uint8_t neighbor_hops = neighbor->getHopsToBaseStation();
         Vector3D diff = self_position->distanceFromCoords(neighbor->getPosition());
         if (neighbor_hops < self_hops) {

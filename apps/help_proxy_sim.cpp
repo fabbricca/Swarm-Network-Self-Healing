@@ -1,3 +1,5 @@
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <iomanip>
@@ -5,6 +7,10 @@
 #include <limits>
 #include <memory>
 #include <fstream>
+#include <numeric>
+#include <optional>
+#include <sstream>
+#include <string>
 #include <vector>
 
 #include "ns3/core-module.h"
@@ -16,6 +22,7 @@
 #include "platform/ns3/drone/ns3_drone.h"
 #include "platform/ns3/uwb_anchor/ns3_uwb_anchor.h"
 #include "platform/ns3/uwb_channel/uwb_channel.h"
+#include "platform/ns3/uwb_channel/uwb_energy_params.h"
 
 using namespace ns3;
 
@@ -30,25 +37,190 @@ void EnsureMobility(Ptr<Node> node, const Vector& pos) {
   mob->SetPosition(pos);
 }
 
+// Parse an optional override file of the form:
+//   # comments allowed
+//   base=x,y,z
+//   droneN=x,y,z    (N in 1..NUM_DRONES)
+//   anchorN=x,y,z   (N in 1..NUM_ANCHORS)
+// Missing keys keep the simulator's hardcoded defaults. Unknown keys are
+// treated as hard errors so typos can't silently no-op.
+bool loadScenarioOverrides(
+    const std::string& path,
+    std::optional<Vector>& baseOverride,
+    std::vector<std::optional<Vector>>& droneOverrides,
+    std::vector<std::optional<Vector>>& anchorOverrides,
+    std::vector<std::pair<size_t, double>>& kills) {
+  std::ifstream in(path);
+  if (!in.is_open()) {
+    std::cerr << "[Sim] scenarioFile: unable to open " << path << std::endl;
+    return false;
+  }
+
+  const size_t numDrones = droneOverrides.size();
+  const size_t numAnchors = anchorOverrides.size();
+
+  auto parseVec = [&](const std::string& value, Vector& out, const std::string& line) -> bool {
+    double coords[3] = {0.0, 0.0, 0.0};
+    size_t start = 0;
+    for (int i = 0; i < 3; ++i) {
+      size_t end = value.find(',', start);
+      if (i < 2 && end == std::string::npos) {
+        std::cerr << "[Sim] scenarioFile: expected 3 comma-separated numbers on line: " << line << std::endl;
+        return false;
+      }
+      std::string token = value.substr(start, end - start);
+      try {
+        coords[i] = std::stod(token);
+      } catch (...) {
+        std::cerr << "[Sim] scenarioFile: cannot parse number '" << token << "' on line: " << line << std::endl;
+        return false;
+      }
+      start = (end == std::string::npos) ? value.size() : end + 1;
+    }
+    out = Vector(coords[0], coords[1], coords[2]);
+    return true;
+  };
+
+  std::string line;
+  size_t lineno = 0;
+  while (std::getline(in, line)) {
+    ++lineno;
+    // Strip trailing CR (tolerate CRLF) and leading/trailing whitespace.
+    while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t')) line.pop_back();
+    size_t first = line.find_first_not_of(" \t");
+    if (first == std::string::npos) continue;
+    line = line.substr(first);
+    if (line[0] == '#') continue;
+
+    size_t eq = line.find('=');
+    if (eq == std::string::npos) {
+      std::cerr << "[Sim] scenarioFile: missing '=' on line " << lineno << ": " << line << std::endl;
+      return false;
+    }
+    std::string key = line.substr(0, eq);
+    std::string val = line.substr(eq + 1);
+
+    // kill_droneN=T has a scalar RHS (seconds), not a vec3.  Handle it before
+    // invoking parseVec, which would reject a single number.
+    if (key.rfind("kill_drone", 0) == 0) {
+      try {
+        size_t idx = static_cast<size_t>(std::stoul(key.substr(10)));
+        if (idx < 1 || idx > numDrones) {
+          std::cerr << "[Sim] scenarioFile: kill_drone index " << idx
+                    << " out of range 1.." << numDrones << " on line " << lineno << std::endl;
+          return false;
+        }
+        double at_s = std::stod(val);
+        if (at_s < 0.0) {
+          std::cerr << "[Sim] scenarioFile: kill time must be >= 0 on line "
+                    << lineno << ": " << line << std::endl;
+          return false;
+        }
+        kills.emplace_back(idx, at_s);
+      } catch (...) {
+        std::cerr << "[Sim] scenarioFile: bad kill entry '" << line
+                  << "' on line " << lineno << std::endl;
+        return false;
+      }
+      continue;
+    }
+
+    Vector pos;
+    if (!parseVec(val, pos, line)) return false;
+
+    if (key == "base") {
+      baseOverride = pos;
+    } else if (key.rfind("drone", 0) == 0) {
+      try {
+        size_t idx = static_cast<size_t>(std::stoul(key.substr(5)));
+        if (idx < 1 || idx > numDrones) {
+          std::cerr << "[Sim] scenarioFile: drone index " << idx
+                    << " out of range 1.." << numDrones << " on line " << lineno << std::endl;
+          return false;
+        }
+        droneOverrides[idx - 1] = pos;
+      } catch (...) {
+        std::cerr << "[Sim] scenarioFile: bad drone key '" << key << "' on line " << lineno << std::endl;
+        return false;
+      }
+    } else if (key.rfind("anchor", 0) == 0) {
+      try {
+        size_t idx = static_cast<size_t>(std::stoul(key.substr(6)));
+        if (idx < 1 || idx > numAnchors) {
+          std::cerr << "[Sim] scenarioFile: anchor index " << idx
+                    << " out of range 1.." << numAnchors << " on line " << lineno << std::endl;
+          return false;
+        }
+        anchorOverrides[idx - 1] = pos;
+      } catch (...) {
+        std::cerr << "[Sim] scenarioFile: bad anchor key '" << key << "' on line " << lineno << std::endl;
+        return false;
+      }
+    } else {
+      std::cerr << "[Sim] scenarioFile: unknown key '" << key << "' on line " << lineno << std::endl;
+      return false;
+    }
+  }
+  return true;
+}
+
+// ── Aggregation helpers for end-of-sim metrics ──
+struct AggStats {
+  size_t count = 0;
+  double avg = 0.0;
+  double p50 = 0.0;
+  double p95 = 0.0;
+  double max = 0.0;
+  double stddev = 0.0;
+};
+
+double percentile(std::vector<double> values, double p) {
+  if (values.empty()) return 0.0;
+  std::sort(values.begin(), values.end());
+  if (values.size() == 1) return values[0];
+  const double rank = p * static_cast<double>(values.size() - 1);
+  const size_t lo = static_cast<size_t>(std::floor(rank));
+  const size_t hi = static_cast<size_t>(std::ceil(rank));
+  const double frac = rank - static_cast<double>(lo);
+  return values[lo] + (values[hi] - values[lo]) * frac;
+}
+
+AggStats aggregateStats(const std::vector<double>& v) {
+  AggStats s;
+  s.count = v.size();
+  if (v.empty()) return s;
+  const double sum = std::accumulate(v.begin(), v.end(), 0.0);
+  s.avg = sum / static_cast<double>(v.size());
+  s.p50 = percentile(v, 0.50);
+  s.p95 = percentile(v, 0.95);
+  s.max = *std::max_element(v.begin(), v.end());
+  double sq = 0.0;
+  for (double x : v) { const double d = x - s.avg; sq += d * d; }
+  s.stddev = std::sqrt(sq / static_cast<double>(v.size()));
+  return s;
+}
+
+std::string fmtNum(double v, int precision = 2) {
+  std::ostringstream oss;
+  oss << std::fixed << std::setprecision(precision) << v;
+  return oss.str();
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
   Time::SetResolution(Time::NS);
 
-  // Self-healing protocol — 3-hop relay chain across 10 drones:
+  // Self-healing protocol — multi-hop relay chain across 20 drones:
   //
-  // Drones 1-3 (< 50m from base): in base coverage, become relay helpers (mission_active=true).
-  // Drones 4-10 (>= 50m from base): outside base coverage, emit HELP_PROXY.
-  //
-  // Relay topology:
-  //   Base → D1,D2,D3 (direct) → D4,D5 (1-hop lost) → D6,D7,D10 (2-hop lost) → D8,D9 (3-hop lost)
-  //
-  // Lost drones stay put and passively relay HELP_PROXY upstream via multi-hop deduped
-  // broadcast relay. Only in-coverage drones (mission_active=true) reposition.
+  // Sectorial layout: 6 helpers at 40 m spaced 60° around the base,
+  // 14 lost drones at 75-85 m split across the 6 sectors (3-2-3-2-2-2).
+  // This forces each helper to serve a distinct subset of lost drones and
+  // makes cross-sector relay an opt-in edge case rather than the default.
 
   double maxRangeMeters = 50.0;
   double simSeconds = 300.0;
-  double kAtt = 1.0;
+  double kAtt = 0.3;
   double kRep = 8.0;
   double dSafe = 2.0;
   double vMax = 1.0;
@@ -57,6 +229,7 @@ int main(int argc, char* argv[]) {
   std::string csvOut = "";
   std::string animOut = "/output/drone-simulation.xml";
   std::string algorithmName = "centroid";
+  std::string scenarioFile = "";
 
 
   CommandLine cmd;
@@ -71,6 +244,7 @@ int main(int argc, char* argv[]) {
   cmd.AddValue("uwbNoiseStdDev", "UWB LOS noise std dev in meters", uwbNoiseStdDev);
   cmd.AddValue("csvOut", "CSV path for reposition logs (empty disables)", csvOut);
   cmd.AddValue("animOut", "NetAnim XML output path (empty disables)", animOut);
+  cmd.AddValue("scenarioFile", "Optional override file for base/drone/anchor positions", scenarioFile);
   cmd.Parse(argc, argv);
 
   const auto parsedAlgo = parseControllerAlgorithm(algorithmName);
@@ -87,8 +261,70 @@ int main(int argc, char* argv[]) {
   uwbCfg.maxRangeMeters = maxRangeMeters;
   sim::UwbChannel::Get().Configure(uwbCfg);
 
-  constexpr uint32_t NUM_DRONES = 10;
-  constexpr uint32_t NUM_ANCHORS = 12;  // standalone UWB anchors (base is also an anchor)
+  constexpr uint32_t NUM_DRONES = 20;
+  constexpr uint32_t NUM_ANCHORS = 18;  // standalone UWB anchors (base is also an anchor)
+
+  // Sectorial default positions; a scenarioFile may selectively override any subset.
+  // Drones 1-6 are helpers at 40 m radius spaced 60° around the base.
+  // Drones 7-20 are 14 lost drones spread across the same 6 sectors at 75-85 m.
+  const Vector baseDefault(0.0, 0.0, 0.0);
+  const Vector droneDefaults[NUM_DRONES] = {
+    {  40.00,   0.00, 0.0},  // D1  helper  (0°, 40m)
+    {  20.00,  34.64, 0.0},  // D2  helper  (60°)
+    { -20.00,  34.64, 0.0},  // D3  helper  (120°)
+    { -40.00,   0.00, 0.0},  // D4  helper  (180°)
+    { -20.00, -34.64, 0.0},  // D5  helper  (240°)
+    {  20.00, -34.64, 0.0},  // D6  helper  (300°)
+    {  72.44, -19.41, 0.0},  // D7  lost    sector D1 (-15°, 75m)
+    {  85.00,   0.00, 0.0},  // D8  lost    sector D1 (  0°, 85m)
+    {  72.44,  19.41, 0.0},  // D9  lost    sector D1 ( 15°, 75m)
+    {  53.03,  53.03, 0.0},  // D10 lost    sector D2 ( 45°, 75m)
+    {  20.71,  77.27, 0.0},  // D11 lost    sector D2 ( 75°, 80m)
+    { -19.41,  72.44, 0.0},  // D12 lost    sector D3 (105°, 75m)
+    { -42.50,  73.61, 0.0},  // D13 lost    sector D3 (120°, 85m)
+    { -53.03,  53.03, 0.0},  // D14 lost    sector D3 (135°, 75m)
+    { -72.44,  19.41, 0.0},  // D15 lost    sector D4 (165°, 75m)
+    { -77.27, -20.71, 0.0},  // D16 lost    sector D4 (195°, 80m)
+    { -56.57, -56.57, 0.0},  // D17 lost    sector D5 (225°, 80m)
+    { -19.41, -72.44, 0.0},  // D18 lost    sector D5 (255°, 75m)
+    {  20.71, -77.27, 0.0},  // D19 lost    sector D6 (285°, 80m)
+    {  53.03, -53.03, 0.0},  // D20 lost    sector D6 (315°, 75m)
+  };
+  const Vector anchorDefaults[NUM_ANCHORS] = {
+    // Middle ring at 50 m, 12 anchors at 30° spacing (dense so every drone
+    // sees ≥2 non-collinear anchors here regardless of angular position).
+    {  50.00,   0.00, 0.0},   // A1  (  0°)
+    {  43.30,  25.00, 0.0},   // A2  ( 30°)
+    {  25.00,  43.30, 0.0},   // A3  ( 60°)
+    {   0.00,  50.00, 0.0},   // A4  ( 90°)
+    { -25.00,  43.30, 0.0},   // A5  (120°)
+    { -43.30,  25.00, 0.0},   // A6  (150°)
+    { -50.00,   0.00, 0.0},   // A7  (180°)
+    { -43.30, -25.00, 0.0},   // A8  (210°)
+    { -25.00, -43.30, 0.0},   // A9  (240°)
+    {   0.00, -50.00, 0.0},   // A10 (270°)
+    {  25.00, -43.30, 0.0},   // A11 (300°)
+    {  43.30, -25.00, 0.0},   // A12 (330°)
+    // Outer ring at 75 m, 6 anchors on helper angles (backstop for farthest
+    // lost drones so they always see ≥1 outer anchor + multiple middle-ring).
+    {  75.00,   0.00, 0.0},   // A13 (  0°)
+    {  37.50,  64.95, 0.0},   // A14 ( 60°)
+    { -37.50,  64.95, 0.0},   // A15 (120°)
+    { -75.00,   0.00, 0.0},   // A16 (180°)
+    { -37.50, -64.95, 0.0},   // A17 (240°)
+    {  37.50, -64.95, 0.0},   // A18 (300°)
+  };
+
+  std::optional<Vector> baseOverride;
+  std::vector<std::optional<Vector>> droneOverrides(NUM_DRONES);
+  std::vector<std::optional<Vector>> anchorOverrides(NUM_ANCHORS);
+  std::vector<std::pair<size_t, double>> kills;  // (1-based drone index, kill time in seconds)
+  if (!scenarioFile.empty()) {
+    if (!loadScenarioOverrides(scenarioFile, baseOverride, droneOverrides, anchorOverrides, kills)) {
+      return 1;
+    }
+    std::cout << "[Sim] scenarioFile: " << scenarioFile << " applied" << std::endl;
+  }
 
   NodeContainer nodes;
   nodes.Create(1 + NUM_DRONES + NUM_ANCHORS);
@@ -97,61 +333,33 @@ int main(int argc, char* argv[]) {
   // node 11..22: standalone UWB anchors
 
   // Base station
-  EnsureMobility(nodes.Get(0),  Vector(  0.0,   0.0, 0.0));
+  EnsureMobility(nodes.Get(0), baseOverride.value_or(baseDefault));
 
-  // Drones 1-3: inside base coverage (< 50m) — become relay helpers
-  EnsureMobility(nodes.Get(1),  Vector( 35.0,  20.0, 0.0));
-  EnsureMobility(nodes.Get(2),  Vector( 25.0, -15.0, 0.0));
-  EnsureMobility(nodes.Get(3),  Vector( 40.0,  -5.0, 0.0));
+  // Drones 1-10: positions come from override when present, else the default.
+  // Snapshot initial positions for the end-of-sim displacement table.
+  std::vector<Vector> initialDronePos(NUM_DRONES);
+  for (uint32_t i = 0; i < NUM_DRONES; ++i) {
+    initialDronePos[i] = droneOverrides[i].value_or(droneDefaults[i]);
+    EnsureMobility(nodes.Get(i + 1), initialDronePos[i]);
+  }
 
-  // Drones 4-10: outside base coverage — trigger HELP_PROXY, form relay chain
-  EnsureMobility(nodes.Get(4),  Vector( 70.0,  25.0, 0.0));
-  EnsureMobility(nodes.Get(5),  Vector( 75.0, -20.0, 0.0));
-  EnsureMobility(nodes.Get(6),  Vector(105.0,  30.0, 0.0));
-  EnsureMobility(nodes.Get(7),  Vector(115.0, -10.0, 0.0));
-  EnsureMobility(nodes.Get(8),  Vector(60.0,  25.0, 0.0));
-  EnsureMobility(nodes.Get(9),  Vector(135.0, -20.0, 0.0));
-  EnsureMobility(nodes.Get(10), Vector( 90.0,   5.0, 0.0));
+  // UWB anchors (nodes 11-22): positions come from override when present, else default.
+  for (uint32_t i = 0; i < NUM_ANCHORS; ++i) {
+    EnsureMobility(nodes.Get(NUM_DRONES + 1 + i), anchorOverrides[i].value_or(anchorDefaults[i]));
+  }
 
-  // UWB anchors (nodes 11-22): 12 anchors covering the full operational area,
-  // ensuring every drone can hear at least 3 anchors within 50m.
-  EnsureMobility(nodes.Get(11), Vector(  0.0, -30.0, 0.0));
-  EnsureMobility(nodes.Get(12), Vector(-20.0,  10.0, 0.0));
-  EnsureMobility(nodes.Get(13), Vector( 40.0, -20.0, 0.0));
-  EnsureMobility(nodes.Get(14), Vector( 40.0,  30.0, 0.0));
-  EnsureMobility(nodes.Get(15), Vector( 65.0,   0.0, 0.0));
-  EnsureMobility(nodes.Get(16), Vector( 70.0, -30.0, 0.0));
-  EnsureMobility(nodes.Get(17), Vector( 80.0,  30.0, 0.0));
-  EnsureMobility(nodes.Get(18), Vector(105.0, -15.0, 0.0));
-  EnsureMobility(nodes.Get(19), Vector(110.0,  20.0, 0.0));
-  EnsureMobility(nodes.Get(20), Vector(130.0, -25.0, 0.0));
-  EnsureMobility(nodes.Get(21), Vector(140.0,  10.0, 0.0));
-  EnsureMobility(nodes.Get(22), Vector(125.0,  35.0, 0.0));
-
+  Vector basePosVec = baseOverride.value_or(baseDefault);
   Ns3BaseStation base(0, nodes.Get(0));
-  base.setPosition(0.0, 0.0, 0.0);
+  base.setPosition(basePosVec.x, basePosVec.y, basePosVec.z);
 
   // Create standalone UWB anchors.
   std::vector<std::unique_ptr<Ns3UwbAnchor>> anchors;
   anchors.reserve(NUM_ANCHORS);
-  const Vector anchorPositions[] = {
-    {  0.0, -30.0, 0.0},   // A1  (node 11, id 11)
-    {-20.0,  10.0, 0.0},   // A2  (node 12, id 12)
-    { 40.0, -20.0, 0.0},   // A3  (node 13, id 13)
-    { 40.0,  30.0, 0.0},   // A4  (node 14, id 14)
-    { 65.0,   0.0, 0.0},   // A5  (node 15, id 15)
-    { 70.0, -30.0, 0.0},   // A6  (node 16, id 16)
-    { 80.0,  30.0, 0.0},   // A7  (node 17, id 17)
-    {105.0, -15.0, 0.0},   // A8  (node 18, id 18)
-    {110.0,  20.0, 0.0},   // A9  (node 19, id 19)
-    {130.0, -25.0, 0.0},   // A10 (node 20, id 20)
-    {140.0,  10.0, 0.0},   // A11 (node 21, id 21)
-    {125.0,  35.0, 0.0},   // A12 (node 22, id 22)
-  };
   for (uint32_t i = 0; i < NUM_ANCHORS; ++i) {
     uint8_t anchor_id = static_cast<uint8_t>(NUM_DRONES + 1 + i);  // IDs 11..22
     anchors.push_back(std::make_unique<Ns3UwbAnchor>(anchor_id, nodes.Get(NUM_DRONES + 1 + i)));
-    anchors.back()->setPosition(anchorPositions[i].x, anchorPositions[i].y, anchorPositions[i].z);
+    Vector ap = anchorOverrides[i].value_or(anchorDefaults[i]);
+    anchors.back()->setPosition(ap.x, ap.y, ap.z);
   }
 
   std::vector<std::unique_ptr<Ns3Drone>> drones;
@@ -204,15 +412,25 @@ int main(int argc, char* argv[]) {
     d->start();
   }
 
+  // Schedule mid-simulation kills.  kills[i].first is the 1-based drone index
+  // (drone1..droneNUM_DRONES); already validated by loadScenarioOverrides.
+  for (const auto& [idx1, at_s] : kills) {
+    const size_t idx0 = idx1 - 1;
+    Ns3Drone* drone_ptr = drones[idx0].get();
+    Simulator::Schedule(Seconds(at_s), [drone_ptr]() { drone_ptr->kill(); });
+    std::cout << "[Sim] scheduled kill: drone=" << idx1 << " at t=" << at_s << "s" << std::endl;
+  }
+
   std::cout << "[Sim] base coverage=" << maxRangeMeters
             << "m, drones=" << NUM_DRONES
             << ", uwb_anchors=" << NUM_ANCHORS
             << ", stop=" << simSeconds << "s" << std::endl;
 
   AnimationInterface anim(animOut);
-  anim.SetBackgroundImage("whiteBackground.png", -30, -45, 200, 100, true);
+  anim.SetBackgroundImage("whiteBackground.png", -100, -100, 200, 200, true);
   uint32_t baseStationIcon = anim.AddResource("baseStation.png");
   uint32_t droneIcon = anim.AddResource("drone.png");
+  uint32_t uwbAnchorIcon = anim.AddResource("uwbAnchor.png");
 
   anim.UpdateNodeImage(0, baseStationIcon);
   anim.UpdateNodeSize(0, 10, 10);
@@ -222,6 +440,7 @@ int main(int argc, char* argv[]) {
   }
   for (uint32_t i = 0; i < NUM_ANCHORS; ++i) {
     uint32_t nodeIdx = NUM_DRONES + 1 + i;
+    anim.UpdateNodeImage(nodeIdx, uwbAnchorIcon);
     anim.UpdateNodeSize(nodeIdx, 6, 6);
   }
   
@@ -230,6 +449,42 @@ int main(int argc, char* argv[]) {
 
   // ── End-of-simulation performance metrics ──
   std::cout << "\n========== END-OF-SIMULATION METRICS ==========\n";
+
+  // ── 0. Scheduled failures (only if any kills were configured) ──
+  // Printed first so later blocks (Healing, Return, FinalCoverage) are read in
+  // the context of "we killed drone X at time T".
+  if (!kills.empty()) {
+    std::cout << "\n── Scheduled Failures ──\n";
+    std::cout << std::left
+              << std::setw(8)  << "Drone"
+              << std::setw(14) << "KilledAt(s)"
+              << std::setw(12) << "FinalHops"
+              << "LastGtPos\n";
+
+    uint32_t executed = 0;
+    for (const auto& [idx1, at_s] : kills) {
+      const size_t idx0 = idx1 - 1;
+      const auto& d = drones[idx0];
+      const double ks = d->killedAtS();
+      const bool ran = (ks >= 0.0);
+      if (ran) ++executed;
+
+      const ::Vector3D p = d->currentGtPos();
+      const uint8_t h = d->hopsFromBase();
+      std::string hops_str = (h == 0xFF) ? "?" : std::to_string(static_cast<int>(h));
+
+      std::ostringstream posstr;
+      posstr << "(" << fmtNum(p.x) << "," << fmtNum(p.y) << "," << fmtNum(p.z) << ")";
+
+      std::cout << std::left
+                << std::setw(8)  << static_cast<int>(d->id())
+                << std::setw(14) << (ran ? fmtNum(ks) : std::string("-"))
+                << std::setw(12) << hops_str
+                << posstr.str() << "\n";
+    }
+    std::cout << "Failures: scheduled=" << kills.size()
+              << "  executed=" << executed << "\n";
+  }
 
   // Collect final positions for all drones.
   struct DroneInfo { uint8_t id; bool lost; uint8_t hops; Vector gt; std::vector<double> tri; double err; };
@@ -246,7 +501,7 @@ int main(int argc, char* argv[]) {
     min_error = std::min(min_error, err);
     max_error = std::max(max_error, err);
     total_error += err;
-    bool lost = (drones[i]->id() >= 4);
+    bool lost = (drones[i]->id() >= 7);
     uint8_t hops = drones[i]->hopsFromBase();
     info.push_back({drones[i]->id(), lost, hops, gt, tri, err});
   }
@@ -275,6 +530,32 @@ int main(int argc, char* argv[]) {
   std::cout << "Trilateration: min=" << min_error
             << "m  max=" << max_error
             << "m  avg=" << (total_error / NUM_DRONES) << "m\n";
+
+  // ── 1b. Initial vs final positions (displacement table) ──
+  // Captures how far each drone actually moved from its spawn, useful at a
+  // glance for sanity-checking returning-mode behavior (lost drones that
+  // completed return should have final ≈ some hop-1 coverage position).
+  std::cout << "\n── Initial vs Final Positions ──\n";
+  std::cout << std::left
+            << std::setw(8)  << "Drone"
+            << std::setw(10) << "Role"
+            << std::setw(28) << "Initial (x,y,z)"
+            << std::setw(28) << "Final (x,y,z)"
+            << "Displacement (m)\n";
+  for (uint32_t i = 0; i < NUM_DRONES; ++i) {
+    const Vector& ip = initialDronePos[i];
+    const Vector& fp = info[i].gt;
+    double ddx = fp.x - ip.x, ddy = fp.y - ip.y, ddz = fp.z - ip.z;
+    double disp = std::sqrt(ddx*ddx + ddy*ddy + ddz*ddz);
+    std::string ip_str = "(" + std::to_string(ip.x) + "," + std::to_string(ip.y) + "," + std::to_string(ip.z) + ")";
+    std::string fp_str = "(" + std::to_string(fp.x) + "," + std::to_string(fp.y) + "," + std::to_string(fp.z) + ")";
+    std::cout << std::left
+              << std::setw(8)  << static_cast<int>(info[i].id)
+              << std::setw(10) << (info[i].lost ? "lost" : "helper")
+              << std::setw(28) << ip_str
+              << std::setw(28) << fp_str
+              << disp << "\n";
+  }
 
   // ── 2. Packet receive counts by type ──
   std::cout << "\n── Packet Receive Counts (by type) ──\n";
@@ -336,21 +617,432 @@ int main(int argc, char* argv[]) {
     std::cout << "\n";
   }
 
-  // ── 4. Per-helper midpoint convergence ──
+  // ── 4. Energy Consumption (DWM1000 estimate) ──
+  // Uses Decawave DW1000 datasheet values: 70 mA TX, 113 mA RX, 12 mA idle,
+  // 3.3 V supply, 6.8 Mbps data rate, ~160 µs frame overhead.
+  {
+    using E = sim::Dwm1000EnergyParams;
+    const auto& ch = sim::UwbChannel::Get();
+
+    std::cout << "\n── Energy Consumption (DWM1000 estimate) ──\n";
+    std::cout << std::left
+              << std::setw(8)  << "Node"
+              << std::setw(10) << "Role"
+              << std::setw(10) << "TX"
+              << std::setw(10) << "RX"
+              << std::setw(12) << "TX(J)"
+              << std::setw(12) << "RX(J)"
+              << std::setw(12) << "Idle(J)"
+              << "Total(J)\n";
+
+    double energy_base = 0.0, energy_helper = 0.0, energy_lost = 0.0, energy_anchors = 0.0;
+
+    auto printRow = [&](uint8_t id, const std::string& role) -> double {
+      const auto& es = ch.GetEnergyStats(id);
+      double tx_j = es.tx_active_s * E::TX_CURRENT_A * E::SUPPLY_VOLTAGE_V;
+      double rx_j = es.rx_active_s * E::RX_CURRENT_A * E::SUPPLY_VOLTAGE_V;
+      double idle_s = simSeconds - es.tx_active_s - es.rx_active_s;
+      if (idle_s < 0.0) idle_s = 0.0;
+      double idle_j = E::idleEnergy(idle_s);
+      double total  = tx_j + rx_j + idle_j;
+
+      std::cout << std::left
+                << std::setw(8)  << static_cast<int>(id)
+                << std::setw(10) << role
+                << std::setw(10) << es.tx_count
+                << std::setw(10) << es.rx_count
+                << std::setw(12) << tx_j
+                << std::setw(12) << rx_j
+                << std::setw(12) << idle_j
+                << total << "\n";
+      return total;
+    };
+
+    // Base station (id 0).
+    energy_base = printRow(0, "base");
+
+    // Drones 1..10.
+    for (uint32_t i = 0; i < NUM_DRONES; ++i) {
+      double e = printRow(static_cast<uint8_t>(i + 1), info[i].lost ? "lost" : "helper");
+      if (info[i].lost) energy_lost += e;
+      else              energy_helper += e;
+    }
+
+    // Anchors 11..22.
+    for (uint32_t i = 0; i < NUM_ANCHORS; ++i) {
+      energy_anchors += printRow(static_cast<uint8_t>(NUM_DRONES + 1 + i), "anchor");
+    }
+
+    double energy_all = energy_base + energy_helper + energy_lost + energy_anchors;
+    std::cout << "Energy total: base=" << energy_base << "J"
+              << "  helper=" << energy_helper << "J"
+              << "  lost=" << energy_lost << "J"
+              << "  anchors=" << energy_anchors << "J"
+              << "  all=" << energy_all << "J\n";
+  }
+
+  // ── 5. Return behavior (platoon-based lost-drone return) ──
+  // Per-drone timeline of the return cascade: when the drone broadcast
+  // HELP_PROXY, when it armed the return timer (first relayed ACK seen),
+  // when it actually started moving back (timeout expired or next-hop flag
+  // received), and when it re-entered base coverage (hops==1).
+  {
+    std::cout << "\n── Return Behavior ──\n";
+    std::cout << std::left
+              << std::setw(8)  << "Drone"
+              << std::setw(10) << "Role"
+              << std::setw(7)  << "Hops"
+              << std::setw(12) << "HelpTx(s)"
+              << std::setw(12) << "Armed(s)"
+              << std::setw(12) << "Start(s)"
+              << std::setw(13) << "Complete(s)"
+              << "Trigger\n";
+
+    auto fmt = [](double v) -> std::string {
+      if (v < 0.0) return "-";
+      std::ostringstream oss;
+      oss << std::fixed << std::setprecision(2) << v;
+      return oss.str();
+    };
+
+    uint32_t n_lost_total = 0, n_armed = 0, n_started = 0, n_completed = 0;
+    double sum_help_to_complete = 0.0;
+    uint32_t n_sum = 0;
+
+    for (uint32_t i = 0; i < NUM_DRONES; ++i) {
+      const auto& d = drones[i];
+      const std::string hops_str = (info[i].hops == 0xFF) ? "?" : std::to_string(static_cast<int>(info[i].hops));
+      const double help_tx  = d->helpProxyTxTime();
+      const double armed_s  = d->returnArmedTime();
+      const double start_s  = d->returnStartTime();
+      const double done_s   = d->returnCompleteTime();
+      const bool   armed    = d->returnArmed();
+      const bool   started  = start_s >= 0.0;
+      const bool   done     = done_s  >= 0.0;
+      std::string trigger = "-";
+      if (started) trigger = d->returnTriggerWasFlag() ? "flag" : "timeout";
+
+      std::cout << std::left
+                << std::setw(8)  << static_cast<int>(d->id())
+                << std::setw(10) << (info[i].lost ? "lost" : "helper")
+                << std::setw(7)  << hops_str
+                << std::setw(12) << fmt(help_tx)
+                << std::setw(12) << fmt(armed_s)
+                << std::setw(12) << fmt(start_s)
+                << std::setw(13) << fmt(done_s)
+                << trigger << "\n";
+
+      if (info[i].lost) {
+        ++n_lost_total;
+        if (armed)   ++n_armed;
+        if (started) ++n_started;
+        if (done)    ++n_completed;
+        if (done && help_tx >= 0.0) {
+          sum_help_to_complete += (done_s - help_tx);
+          ++n_sum;
+        }
+      }
+    }
+
+    std::cout << "Return summary: lost=" << n_lost_total
+              << "  armed=" << n_armed
+              << "  started=" << n_started
+              << "  completed=" << n_completed << "\n";
+    if (n_sum > 0) {
+      std::cout << "Avg help_proxy→complete: "
+                << (sum_help_to_complete / n_sum) << "s ("
+                << n_sum << " drones)\n";
+    } else {
+      std::cout << "Avg help_proxy→complete: N/A (none completed in sim window)\n";
+    }
+  }
+
+  // ── 6. Healing outcome ──
+  // Healing latency = first ACK addressed to us AFTER our HELP_PROXY.  This
+  // measures how long the relay chain takes to form, independent of how long
+  // the lost drone takes to physically return.
+  {
+    std::cout << "\n── Healing Outcome ──\n";
+    std::cout << std::left
+              << std::setw(8)  << "Drone"
+              << std::setw(10) << "Role"
+              << std::setw(12) << "HelpTx(s)"
+              << std::setw(13) << "FirstAck(s)"
+              << std::setw(12) << "Healing(s)"
+              << "Return(s)\n";
+
+    auto fmtOpt = [](double v) -> std::string {
+      if (v < 0.0) return "-";
+      return fmtNum(v);
+    };
+
+    std::vector<double> healing_latencies;
+    std::vector<double> return_latencies;
+    uint32_t lost_count = 0, armed_count = 0, started_count = 0, completed_count = 0;
+
+    for (uint32_t i = 0; i < NUM_DRONES; ++i) {
+      const auto& d = drones[i];
+      const bool killed = (d->killedAtS() >= 0.0);
+      const double help_tx = d->helpProxyTxTime();
+      const double first_ack = d->firstAckAfterHelpS();
+      const double armed_s = d->returnArmedTime();
+      const double done_s = d->returnCompleteTime();
+
+      const double healing = (help_tx >= 0.0 && first_ack >= 0.0) ? (first_ack - help_tx) : -1.0;
+      const double ret = (armed_s >= 0.0 && done_s >= 0.0) ? (done_s - armed_s) : -1.0;
+
+      const char* role = killed ? "dead" : (info[i].lost ? "lost" : "helper");
+
+      std::cout << std::left
+                << std::setw(8)  << static_cast<int>(d->id())
+                << std::setw(10) << role
+                << std::setw(12) << fmtOpt(help_tx)
+                << std::setw(13) << fmtOpt(first_ack)
+                << std::setw(12) << fmtOpt(healing)
+                << fmtOpt(ret) << "\n";
+
+      if (info[i].lost && !killed) {
+        ++lost_count;
+        if (d->returnArmed()) ++armed_count;
+        if (d->returnStartTime() >= 0.0) ++started_count;
+        if (done_s >= 0.0) ++completed_count;
+        if (healing >= 0.0) healing_latencies.push_back(healing);
+        if (ret >= 0.0) return_latencies.push_back(ret);
+      }
+    }
+
+    const auto heal = aggregateStats(healing_latencies);
+    const auto retu = aggregateStats(return_latencies);
+    const double rate = (lost_count > 0) ? (100.0 * completed_count / lost_count) : 0.0;
+
+    std::cout << "Healing: drones=" << heal.count;
+    if (heal.count > 0) {
+      std::cout << "  avg=" << fmtNum(heal.avg) << "s"
+                << "  p50=" << fmtNum(heal.p50) << "s"
+                << "  p95=" << fmtNum(heal.p95) << "s"
+                << "  max=" << fmtNum(heal.max) << "s";
+    }
+    std::cout << "\n";
+
+    std::cout << "Return: drones=" << retu.count;
+    if (retu.count > 0) {
+      std::cout << "  avg=" << fmtNum(retu.avg) << "s"
+                << "  p50=" << fmtNum(retu.p50) << "s"
+                << "  p95=" << fmtNum(retu.p95) << "s"
+                << "  max=" << fmtNum(retu.max) << "s";
+    }
+    std::cout << "\n";
+
+    std::cout << "Recovery: lost=" << lost_count
+              << "  armed=" << armed_count
+              << "  started=" << started_count
+              << "  completed=" << completed_count
+              << "  rate=" << fmtNum(rate, 1) << "%\n";
+  }
+
+  // ── 7. Return quality ──
+  // Return path efficiency = actual path / straight-line distance (>= 1.0).
+  // Boundary distance = ‖returnComplete − base‖; should hug maxRangeMeters.
+  // Rearm count = how many times the drone re-entered return mode after
+  // losing direct coverage during station-keeping.
+  {
+    std::cout << "\n── Return Quality ──\n";
+    std::cout << std::left
+              << std::setw(8)  << "Drone"
+              << std::setw(10) << "Role"
+              << std::setw(10) << "PathEff"
+              << std::setw(13) << "Boundary(m)"
+              << "Rearms\n";
+
+    auto fmtOpt = [](double v) -> std::string {
+      if (v < 0.0) return "-";
+      return fmtNum(v);
+    };
+
+    std::vector<double> path_effs;
+    std::vector<double> boundaries;
+    std::vector<double> rearms;
+
+    for (uint32_t i = 0; i < NUM_DRONES; ++i) {
+      const auto& d = drones[i];
+      const bool killed = (d->killedAtS() >= 0.0);
+      const double done_s = d->returnCompleteTime();
+      double path_eff = -1.0;
+      double boundary = -1.0;
+
+      if (done_s >= 0.0) {
+        const ::Vector3D start = d->returnStartPosGt();
+        const ::Vector3D end = d->returnCompletePosGt();
+        const double dx = end.x - start.x, dy = end.y - start.y, dz = end.z - start.z;
+        const double straight = std::sqrt(dx * dx + dy * dy + dz * dz);
+        const double path = d->returnPhaseDistanceM();
+        if (straight > 1e-3) {
+          path_eff = path / straight;
+        }
+        const double bx = end.x - basePosVec.x;
+        const double by = end.y - basePosVec.y;
+        const double bz = end.z - basePosVec.z;
+        boundary = std::sqrt(bx * bx + by * by + bz * bz);
+      }
+      const uint32_t rearm = d->rearmCount();
+
+      const char* role = killed ? "dead" : (info[i].lost ? "lost" : "helper");
+
+      std::cout << std::left
+                << std::setw(8)  << static_cast<int>(d->id())
+                << std::setw(10) << role
+                << std::setw(10) << fmtOpt(path_eff)
+                << std::setw(13) << fmtOpt(boundary)
+                << rearm << "\n";
+
+      if (info[i].lost && !killed) {
+        if (path_eff >= 0.0) path_effs.push_back(path_eff);
+        if (boundary >= 0.0) boundaries.push_back(boundary);
+        rearms.push_back(static_cast<double>(rearm));
+      }
+    }
+
+    const auto pe = aggregateStats(path_effs);
+    const auto bd = aggregateStats(boundaries);
+
+    std::cout << "ReturnPath: drones=" << pe.count;
+    if (pe.count > 0) {
+      std::cout << "  avg=" << fmtNum(pe.avg)
+                << "  p95=" << fmtNum(pe.p95)
+                << "  max=" << fmtNum(pe.max);
+    }
+    std::cout << "\n";
+
+    std::cout << "Boundary: drones=" << bd.count;
+    if (bd.count > 0) {
+      std::cout << "  avg=" << fmtNum(bd.avg) << "m"
+                << "  stddev=" << fmtNum(bd.stddev) << "m"
+                << "  target=" << fmtNum(maxRangeMeters) << "m";
+    }
+    std::cout << "\n";
+
+    uint32_t rearm_total = 0, rearm_max = 0;
+    for (double r : rearms) {
+      rearm_total += static_cast<uint32_t>(r);
+      if (r > rearm_max) rearm_max = static_cast<uint32_t>(r);
+    }
+    std::cout << "Rearm: drones=" << rearms.size()
+              << "  total=" << rearm_total
+              << "  max=" << rearm_max << "\n";
+  }
+
+  // ── 8. Post-return stability ──
+  // Drift from the station-keeping reference position vs. final hop count.
+  // A healthy run has StationDrift ≈ 0 and every drone reachable at ≤ 2 hops.
+  {
+    std::cout << "\n── Post-Return Stability ──\n";
+    std::cout << std::left
+              << std::setw(8)  << "Drone"
+              << std::setw(10) << "Role"
+              << std::setw(17) << "StationDrift(m)"
+              << "FinalHops\n";
+
+    auto fmtOpt = [](double v) -> std::string {
+      if (v < 0.0) return "-";
+      return fmtNum(v);
+    };
+
+    std::vector<double> drifts;
+    uint32_t hops1 = 0, hops2 = 0, hops3plus = 0, lost_hop = 0, covered = 0, dead = 0;
+
+    for (uint32_t i = 0; i < NUM_DRONES; ++i) {
+      const auto& d = drones[i];
+      const bool killed = (d->killedAtS() >= 0.0);
+      const double done_s = d->returnCompleteTime();
+      const double drift = (done_s >= 0.0) ? d->stationKeepingDriftM() : -1.0;
+      const uint8_t h = info[i].hops;
+      std::string hops_str = (h == 0xFF) ? "?" : std::to_string(static_cast<int>(h));
+
+      const char* role = killed ? "dead" : (info[i].lost ? "lost" : "helper");
+
+      std::cout << std::left
+                << std::setw(8)  << static_cast<int>(d->id())
+                << std::setw(10) << role
+                << std::setw(17) << fmtOpt(drift)
+                << hops_str << "\n";
+
+      if (info[i].lost && !killed && drift >= 0.0) drifts.push_back(drift);
+
+      // Coverage bucketing: killed drones get their own bucket and don't count
+      // toward the `lost` protocol-failure tally.  Denominator drops by K so a
+      // mid-sim kill doesn't make the coverage rate look artificially worse.
+      if (killed) {
+        ++dead;
+      } else if (h == 0xFF) {
+        ++lost_hop;
+      } else {
+        ++covered;
+        if (h == 1) ++hops1;
+        else if (h == 2) ++hops2;
+        else if (h >= 3) ++hops3plus;
+      }
+    }
+
+    const auto dr = aggregateStats(drifts);
+    const uint32_t denom = NUM_DRONES - dead;
+    const double cov_rate = (denom > 0) ? (100.0 * covered / denom) : 0.0;
+
+    std::cout << "StationDrift: drones=" << dr.count;
+    if (dr.count > 0) {
+      std::cout << "  avg=" << fmtNum(dr.avg) << "m"
+                << "  p95=" << fmtNum(dr.p95) << "m"
+                << "  max=" << fmtNum(dr.max) << "m";
+    }
+    std::cout << "\n";
+
+    std::cout << "FinalCoverage: covered=" << covered
+              << "  total=" << denom
+              << "  rate=" << fmtNum(cov_rate, 1) << "%"
+              << "  hops1=" << hops1
+              << "  hops2=" << hops2
+              << "  hops3plus=" << hops3plus
+              << "  lost=" << lost_hop
+              << "  dead=" << dead << "\n";
+  }
+
+  // ── 9. Per-helper midpoint convergence ──
   // Each helper drone only hears hop-2 drones within maxRangeMeters.  Its centroid
   // (and therefore its ideal midpoint) depends on which hop-2 drones it can see.
+  //
+  // Equilibrium-position semantics: for lost drones that completed return, we
+  // use the position captured at return-complete (where they station-keep).
+  // For helpers and non-completed drones, we use sim-end ground truth.  If no
+  // lost drone completed, the block is tagged " (no-equilibrium)".
   auto baseMob = nodes.Get(0)->GetObject<ConstantPositionMobilityModel>();
   Vector basePos = baseMob->GetPosition();
 
-  // Collect hop-2 drones.
-  std::vector<const DroneInfo*> hop2_drones;
-  for (const auto& d : info) {
+  // Build equilibrium positions.
+  struct EqPos { uint8_t id; bool lost; uint8_t hops; Vector pos; };
+  std::vector<EqPos> eq;
+  double max_return_complete_s = -1.0;
+  uint32_t n_completed_eq = 0;
+  for (uint32_t i = 0; i < NUM_DRONES; ++i) {
+    const double done_s = drones[i]->returnCompleteTime();
+    Vector pos = info[i].gt;
+    if (done_s >= 0.0) {
+      const ::Vector3D p = drones[i]->returnCompletePosGt();
+      pos = Vector(p.x, p.y, p.z);
+      if (done_s > max_return_complete_s) max_return_complete_s = done_s;
+      ++n_completed_eq;
+    }
+    eq.push_back({info[i].id, info[i].lost, info[i].hops, pos});
+  }
+  const bool no_equilibrium = (n_completed_eq == 0);
+
+  // Collect hop-2 drones (using equilibrium positions).
+  std::vector<const EqPos*> hop2_drones;
+  for (const auto& d : eq) {
     if (d.hops == 2) hop2_drones.push_back(&d);
   }
 
   // Global centroid (for reference).
   double gcx = 0.0, gcy = 0.0, gcz = 0.0;
-  for (const auto* d : hop2_drones) { gcx += d->gt.x; gcy += d->gt.y; gcz += d->gt.z; }
+  for (const auto* d : hop2_drones) { gcx += d->pos.x; gcy += d->pos.y; gcz += d->pos.z; }
   if (!hop2_drones.empty()) {
     double n = static_cast<double>(hop2_drones.size());
     gcx /= n; gcy /= n; gcz /= n;
@@ -359,7 +1051,9 @@ int main(int argc, char* argv[]) {
   double gmidY = (basePos.y + gcy) / 2.0;
   double gmidZ = (basePos.z + gcz) / 2.0;
 
-  std::cout << "\n── Per-Helper Midpoint Convergence ──\n";
+  std::cout << "\n── Per-Helper Midpoint Convergence ──";
+  if (no_equilibrium) std::cout << " (no-equilibrium)";
+  std::cout << "\n";
   std::cout << "Base station: (" << basePos.x << "," << basePos.y << "," << basePos.z << ")\n";
   if (!hop2_drones.empty()) {
     std::cout << "Global hop-2 centroid (" << hop2_drones.size() << " drones): ("
@@ -368,13 +1062,13 @@ int main(int argc, char* argv[]) {
   }
 
   std::cout << "\n";
-  for (const auto& h : info) {
+  for (const auto& h : eq) {
     if (h.lost) continue;
 
-    // Find hop-2 drones within range of this helper.
-    std::vector<const DroneInfo*> visible;
+    // Find hop-2 drones within range of this helper (using equilibrium positions).
+    std::vector<const EqPos*> visible;
     for (const auto* d : hop2_drones) {
-      double dx = h.gt.x - d->gt.x, dy = h.gt.y - d->gt.y, dz = h.gt.z - d->gt.z;
+      double dx = h.pos.x - d->pos.x, dy = h.pos.y - d->pos.y, dz = h.pos.z - d->pos.z;
       if (std::sqrt(dx*dx + dy*dy + dz*dz) <= maxRangeMeters) {
         visible.push_back(d);
       }
@@ -383,7 +1077,7 @@ int main(int argc, char* argv[]) {
     std::string hops_str = (h.hops == 0xFF) ? "?" : std::to_string(static_cast<int>(h.hops));
     std::cout << "  helper " << static_cast<int>(h.id)
               << " (hops=" << hops_str << ")"
-              << "  pos=(" << h.gt.x << "," << h.gt.y << "," << h.gt.z << ")\n";
+              << "  pos=(" << h.pos.x << "," << h.pos.y << "," << h.pos.z << ")\n";
 
     if (visible.empty()) {
       std::cout << "    sees: no hop-2 drones in range — did not start mission\n";
@@ -395,8 +1089,8 @@ int main(int argc, char* argv[]) {
     std::cout << "    sees:";
     for (const auto* v : visible) {
       std::cout << " D" << static_cast<int>(v->id)
-                << "(" << v->gt.x << "," << v->gt.y << ")";
-      lcx += v->gt.x; lcy += v->gt.y; lcz += v->gt.z;
+                << "(" << v->pos.x << "," << v->pos.y << ")";
+      lcx += v->pos.x; lcy += v->pos.y; lcz += v->pos.z;
     }
     double vn = static_cast<double>(visible.size());
     lcx /= vn; lcy /= vn; lcz /= vn;
@@ -405,9 +1099,9 @@ int main(int argc, char* argv[]) {
     double lmidX = (basePos.x + lcx) / 2.0;
     double lmidY = (basePos.y + lcy) / 2.0;
     double lmidZ = (basePos.z + lcz) / 2.0;
-    double dist = std::sqrt((h.gt.x-lmidX)*(h.gt.x-lmidX)
-                          + (h.gt.y-lmidY)*(h.gt.y-lmidY)
-                          + (h.gt.z-lmidZ)*(h.gt.z-lmidZ));
+    double dist = std::sqrt((h.pos.x-lmidX)*(h.pos.x-lmidX)
+                          + (h.pos.y-lmidY)*(h.pos.y-lmidY)
+                          + (h.pos.z-lmidZ)*(h.pos.z-lmidZ));
 
     std::cout << "    local centroid: (" << lcx << "," << lcy << "," << lcz << ")"
               << "  local midpoint: (" << lmidX << "," << lmidY << "," << lmidZ << ")"

@@ -127,6 +127,17 @@ std::vector<double> CustomMobility::getPosition() {
     };
 }
 
+void CustomMobility::brake() {
+    // Flush any accumulated motion at the current velocity up to now, then
+    // zero everything so the drone holds position on subsequent ticks.
+    update();
+    acceleration = Vector3D(0.0, 0.0, 0.0);
+    velocity = Vector3D(0.0, 0.0, 0.0);
+    max_velocity = 0.0;
+    delta_t_max_velocity_s = 0.0;
+    previous_time_s = ns3::Simulator::Now().GetSeconds();
+}
+
 void CustomMobility::updateVelocity(const Vector3D new_acceleration, const double new_max_velocity) {
     // First, apply any pending motion from the previous acceleration
     update();

@@ -72,6 +72,7 @@ METRIC_SPECS = [
     ("station_drift_max_m", "Station drift max (m)", 1.0),
     ("final_coverage_rate_pct", "Final coverage rate (%)", 1.0),
     ("failures_executed", "Failures executed", 1.0),
+    ("base_failures_executed", "Base failures executed", 1.0),
 ]
 
 PARAM_TO_CLI = {
@@ -174,7 +175,8 @@ FINAL_COVERAGE_RE = re.compile(
     r"(?:\s+dead=(\d+))?"
 )
 
-FAILURES_RE = re.compile(r"Failures:\s*scheduled=(\d+)\s+executed=(\d+)")
+FAILURES_RE = re.compile(r"(?:^|\s)Failures:\s*scheduled=(\d+)\s+executed=(\d+)")
+BASE_FAILURES_RE = re.compile(r"BaseFailures:\s*scheduled=(\d+)\s+executed=(\d+)")
 
 DRONE_KEY_RE = re.compile(r"^drone(\d+)$", re.IGNORECASE)
 ANCHOR_KEY_RE = re.compile(r"^(anchor|uwb_anchor)(\d+)$", re.IGNORECASE)
@@ -196,11 +198,11 @@ class Scenario:
     params: dict[str, float]
     failures: list[tuple[int, float]] = field(default_factory=list)
     # v1 multi-base: up to 3 base positions (index 1-based in scenario file).
-    # When `bases` is non-empty it supersedes `base_station` / defaults.
     bases: list[Vec3] = field(default_factory=list)
-    # Optional per-drone base assignment: drone_idx (1-based) -> base_idx (1-based).
-    # Missing entries default to base 1.
+    # v1 pinning (v2 silently ignores it but we still round-trip it).
     drone_base: dict[int, int] = field(default_factory=dict)
+    # v2: mid-sim base kills (base_idx 1-based, at_seconds).
+    base_failures: list[tuple[int, float]] = field(default_factory=list)
 
 
 @dataclass
@@ -212,6 +214,7 @@ class ScenarioDefaults:
     failures: list[tuple[int, float]] = field(default_factory=list)
     bases: list[Vec3] = field(default_factory=list)
     drone_base: dict[int, int] = field(default_factory=dict)
+    base_failures: list[tuple[int, float]] = field(default_factory=list)
 
 
 @dataclass
@@ -370,6 +373,46 @@ def parse_bases_block(value: Any, where: str) -> list[Vec3]:
     return out
 
 
+def parse_base_failures_block(value: Any, where: str) -> list[tuple[int, float]]:
+    """Parse an optional list of {base, at_seconds} kill schedules.
+
+    `base` may be an int (1-based slot) or a string like "base1".
+    """
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise DeclarationError(f"{where}: expected a list of base failure entries")
+    out: list[tuple[int, float]] = []
+    for i, item in enumerate(value):
+        loc = f"{where}[{i}]"
+        if not isinstance(item, dict):
+            raise DeclarationError(f"{loc}: expected an object with 'base' and 'at_seconds'")
+        if "base" not in item:
+            raise DeclarationError(f"{loc}: missing required key 'base'")
+        if "at_seconds" not in item:
+            raise DeclarationError(f"{loc}: missing required key 'at_seconds'")
+
+        raw = item["base"]
+        if isinstance(raw, int):
+            idx = raw
+        else:
+            text = str(raw).strip().lower()
+            if text.startswith("base"):
+                text = text[4:]
+            try:
+                idx = int(text)
+            except ValueError:
+                raise DeclarationError(f"{loc}.base: invalid value '{raw}'") from None
+        if idx < 1 or idx > MAX_BASES:
+            raise DeclarationError(f"{loc}.base: index {idx} out of range 1..{MAX_BASES}")
+
+        at_s = as_float(item["at_seconds"], f"{loc}.at_seconds")
+        if at_s < 0:
+            raise DeclarationError(f"{loc}.at_seconds must be >= 0")
+        out.append((idx, at_s))
+    return out
+
+
 def parse_drone_base_block(value: Any, where: str) -> dict[int, int]:
     """Parse drone -> base assignment (both 1-based).
 
@@ -491,6 +534,7 @@ def parse_defaults(raw: dict[str, Any]) -> ScenarioDefaults:
         failures=parse_failures_block(defaults.get("failures"), "defaults.failures"),
         bases=parse_bases_block(defaults.get("bases"), "defaults.bases"),
         drone_base=parse_drone_base_block(defaults.get("drone_base"), "defaults.drone_base"),
+        base_failures=parse_base_failures_block(defaults.get("base_failures"), "defaults.base_failures"),
     )
 
 
@@ -517,6 +561,7 @@ def dedupe_scenario_names(scenarios: list[Scenario]) -> list[Scenario]:
                 failures=scenario.failures,
                 bases=scenario.bases,
                 drone_base=scenario.drone_base,
+                base_failures=scenario.base_failures,
             )
         )
     return out
@@ -564,6 +609,9 @@ def normalize_scenarios(raw: dict[str, Any]) -> list[Scenario]:
         drone_base = dict(scenario_defaults.drone_base)
         drone_base.update(parse_drone_base_block(entry.get("drone_base"), f"{where}.drone_base"))
 
+        base_failures = list(scenario_defaults.base_failures)
+        base_failures.extend(parse_base_failures_block(entry.get("base_failures"), f"{where}.base_failures"))
+
         # Cross-validate: every drone_base reference must fit within configured bases.
         base_count = len(bases) if bases else 1
         for drone_idx, base_idx in drone_base.items():
@@ -576,6 +624,15 @@ def normalize_scenarios(raw: dict[str, Any]) -> list[Scenario]:
         raw_name = entry.get("name", f"sim_{i:03d}")
         name = slugify(str(raw_name)) or f"sim_{i:03d}"
 
+        # base_failures must reference a defined base.
+        base_count = len(bases) if bases else 1
+        for base_idx, _ in base_failures:
+            if base_idx > base_count:
+                raise DeclarationError(
+                    f"{where}.base_failures: base index {base_idx} "
+                    f"exceeds configured base count {base_count}"
+                )
+
         scenarios.append(
             Scenario(
                 name=name,
@@ -586,6 +643,7 @@ def normalize_scenarios(raw: dict[str, Any]) -> list[Scenario]:
                 failures=failures,
                 bases=bases,
                 drone_base=drone_base,
+                base_failures=base_failures,
             )
         )
 
@@ -604,6 +662,10 @@ def scenario_to_json_dict(scenario: Scenario) -> dict[str, Any]:
         "failures": [
             {"drone": f"drone{idx}", "at_seconds": at_s}
             for idx, at_s in sorted(scenario.failures)
+        ],
+        "base_failures": [
+            {"base": f"base{idx}", "at_seconds": at_s}
+            for idx, at_s in sorted(scenario.base_failures)
         ],
     }
 
@@ -634,6 +696,9 @@ def write_override_file(path: Path, scenario: Scenario) -> None:
 
     for drone_idx in sorted(scenario.drone_base):
         lines.append(f"drone{drone_idx}_base={scenario.drone_base[drone_idx]}")
+
+    for base_idx, at_s in sorted(scenario.base_failures):
+        lines.append(f"kill_base{base_idx}={at_s:.6f}")
 
     for idx, at_s in sorted(scenario.failures):
         lines.append(f"kill_drone{idx}={at_s:.6f}")
@@ -857,6 +922,14 @@ def parse_metrics(output: str) -> dict[str, float | int | None]:
     else:
         metrics["failures_scheduled"] = None
         metrics["failures_executed"] = None
+
+    base_failures = BASE_FAILURES_RE.search(output)
+    if base_failures:
+        metrics["base_failures_scheduled"] = int(base_failures.group(1))
+        metrics["base_failures_executed"] = int(base_failures.group(2))
+    else:
+        metrics["base_failures_scheduled"] = None
+        metrics["base_failures_executed"] = None
 
     return metrics
 

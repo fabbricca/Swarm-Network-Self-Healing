@@ -33,8 +33,11 @@
   "simulations": [
     {
       "name": "kill_base1_migrate_east",
-      "params": { "sim_seconds": 240 },
+      "params": { "sim_seconds": 180 },
       "bases": [[-40.0, 0.0, 0.0], [40.0, 0.0, 0.0]],
+      "base_failures": [
+        { "base": "base1", "at_seconds": 60.0 }
+      ],
       "drones": {
         "drone1":  [-25.0,   0.0, 0.0],
         "drone2":  [-20.0,  15.0, 0.0],

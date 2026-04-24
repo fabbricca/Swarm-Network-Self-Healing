@@ -1,65 +1,49 @@
 #include "modules/neighbor/neighbor_manager.h"
 
+#include <algorithm>
+
 NeighborManager::NeighborManager(
     CommunicationManagerInterface* communication_manager
-) : 
-    m_communication_manager(communication_manager) 
+) :
+    m_communication_manager(communication_manager)
 { }
-
-void NeighborManager::setBaseId(uint8_t base_id) {
-    m_base_id = base_id;
-    m_has_base_id = true;
-}
 
 void NeighborManager::onPacketReceived(const ::Packet& pkt) {
     if (pkt.type != ::PacketType::NEIGHBOR) {
         return;
     }
-    if (pkt.payload.size() < 4) {
+    if (pkt.payload.size() < 3) {
         return;
     }
 
-    // Payload format: [neighbor_id][base_id][hops][flags][double coords...]
+    // v2 payload layout:
+    //   [0]   neighbor_id
+    //   [1]   flags
+    //   [2]   num_bases
+    //   [3..] num_bases * (base_id, hops) pairs, then position coords
     const uint8_t neighbor_id = pkt.payload[0];
     if (neighbor_id != pkt.src) {
         // Basic sanity check: outer header src should match payload id.
         return;
     }
 
-    const uint8_t sender_base_id = pkt.payload[1];
-
-    // v1 multi-base partition: discard neighbors attached to a different
-    // base.  Prevents hop-count cross-pollination between isolated swarms.
-    // Exception: if we haven't registered a base yet, accept anything
-    // (bootstrap window before setBaseStation is called).
-    if (m_has_base_id && sender_base_id != m_base_id) {
+    auto info = std::make_unique<NeighborInfo>(neighbor_id,
+                                               std::vector<std::pair<uint8_t, uint8_t>>{},
+                                               false,
+                                               std::vector<double>{});
+    try {
+        info->deserialize(pkt.payload);
+    } catch (const std::exception&) {
         return;
-    }
-
-    const uint8_t hops = pkt.payload[2];
-    const uint8_t flags = pkt.payload[3];
-    const bool returning = (flags & NeighborInfo::FLAG_RETURNING) != 0;
-    const size_t coord_bytes = pkt.payload.size() - 4;
-    if (coord_bytes % sizeof(double) != 0) {
-        return;
-    }
-
-    std::vector<double> coords;
-    coords.resize(coord_bytes / sizeof(double));
-    if (coord_bytes > 0) {
-        std::memcpy(coords.data(), pkt.payload.data() + 4, coord_bytes);
     }
 
     auto& entry = m_neighbors[neighbor_id];
-    entry.info = std::make_unique<NeighborInfo>(neighbor_id, sender_base_id, hops, returning, coords);
+    entry.info = std::move(info);
     entry.last_seen_call = m_call_count;
 }
 
 std::vector<NeighborInfoInterface*> NeighborManager::getNeighbors() const {
-    // Evict entries not refreshed within STALE_CALLS ticks.  This keeps a
-    // drone that has drifted out of RF range from anchoring the controller
-    // to a stale cached position (pre-TTL, a lost drone would keep pulling
-    // toward cached helpers forever, coasting past the relay chain).
+    // Evict entries not refreshed within STALE_CALLS ticks.
     for (auto it = m_neighbors.begin(); it != m_neighbors.end(); ) {
         const uint32_t age = m_call_count - it->second.last_seen_call;
         if (age > STALE_CALLS) {
@@ -80,7 +64,7 @@ std::vector<NeighborInfoInterface*> NeighborManager::getNeighbors() const {
 void NeighborManager::sendToNeighbors(
     uint8_t id,
     PositionInterface* position,
-    uint8_t hops_to_base_station,
+    const std::vector<std::pair<uint8_t, uint8_t>>& per_base_hops,
     bool returning
 ) {
     if (!m_communication_manager || !position) {
@@ -110,7 +94,7 @@ void NeighborManager::sendToNeighbors(
         }
     }
 
-    NeighborInfo info(id, m_base_id, hops_to_base_station, returning, coords);
+    NeighborInfo info(id, per_base_hops, returning, coords);
 
     ::Packet pkt;
     pkt.type = ::PacketType::NEIGHBOR;

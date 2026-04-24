@@ -48,9 +48,10 @@ constexpr uint8_t BASE_IDS[MAX_BASES] = {0, 250, 251};
 //   base=x,y,z                 (alias for base1=)
 //   baseN=x,y,z                (N in 1..MAX_BASES)
 //   droneN=x,y,z               (N in 1..NUM_DRONES)
-//   droneN_base=M              (assign drone N to base M, 1..MAX_BASES)
+//   droneN_base=M              (v1 scenario files only; silently ignored in v2)
 //   anchorN=x,y,z              (N in 1..NUM_ANCHORS)
 //   kill_droneN=T              (schedule mid-sim drone kill)
+//   kill_baseN=T               (schedule mid-sim base kill, N in 1..MAX_BASES)
 // Missing keys keep the simulator's hardcoded defaults. Unknown keys are
 // treated as hard errors so typos can't silently no-op.
 bool loadScenarioOverrides(
@@ -58,8 +59,8 @@ bool loadScenarioOverrides(
     std::vector<std::optional<Vector>>& baseOverrides,
     std::vector<std::optional<Vector>>& droneOverrides,
     std::vector<std::optional<Vector>>& anchorOverrides,
-    std::vector<uint8_t>& droneBaseAssignments,
-    std::vector<std::pair<size_t, double>>& kills) {
+    std::vector<std::pair<size_t, double>>& droneKills,
+    std::vector<std::pair<size_t, double>>& baseKills) {
   std::ifstream in(path);
   if (!in.is_open()) {
     std::cerr << "[Sim] scenarioFile: unable to open " << path << std::endl;
@@ -111,8 +112,7 @@ bool loadScenarioOverrides(
     std::string key = line.substr(0, eq);
     std::string val = line.substr(eq + 1);
 
-    // kill_droneN=T has a scalar RHS (seconds), not a vec3.  Handle it before
-    // invoking parseVec, which would reject a single number.
+    // kill_droneN=T has a scalar RHS (seconds), not a vec3.
     if (key.rfind("kill_drone", 0) == 0) {
       try {
         size_t idx = static_cast<size_t>(std::stoul(key.substr(10)));
@@ -127,7 +127,7 @@ bool loadScenarioOverrides(
                     << lineno << ": " << line << std::endl;
           return false;
         }
-        kills.emplace_back(idx, at_s);
+        droneKills.emplace_back(idx, at_s);
       } catch (...) {
         std::cerr << "[Sim] scenarioFile: bad kill entry '" << line
                   << "' on line " << lineno << std::endl;
@@ -136,8 +136,35 @@ bool loadScenarioOverrides(
       continue;
     }
 
-    // droneN_base=M has a scalar RHS (base index, 1..numBases) — handle
-    // before the droneN= prefix check so the RHS isn't parsed as a vec3.
+    // kill_baseN=T: schedule a base-station kill.  N is 1-based over the
+    // MAX_BASES slots (not the physical BASE_IDS).
+    if (key.rfind("kill_base", 0) == 0) {
+      try {
+        size_t idx = static_cast<size_t>(std::stoul(key.substr(9)));
+        if (idx < 1 || idx > MAX_BASES) {
+          std::cerr << "[Sim] scenarioFile: kill_base index " << idx
+                    << " out of range 1.." << MAX_BASES << " on line " << lineno << std::endl;
+          return false;
+        }
+        double at_s = std::stod(val);
+        if (at_s < 0.0) {
+          std::cerr << "[Sim] scenarioFile: kill time must be >= 0 on line "
+                    << lineno << ": " << line << std::endl;
+          return false;
+        }
+        baseKills.emplace_back(idx, at_s);
+      } catch (...) {
+        std::cerr << "[Sim] scenarioFile: bad kill_base entry '" << line
+                  << "' on line " << lineno << std::endl;
+        return false;
+      }
+      continue;
+    }
+
+    // droneN_base=M: v1 pinning directive.  v2 drones roam freely across all
+    // registered bases, so this is silently accepted (for scenario-file
+    // back-compat) but has no effect.  We still validate the format so a
+    // typo like "droneN_bse=1" still errors via the unknown-key path.
     {
       const size_t under = key.find('_');
       if (under != std::string::npos
@@ -157,7 +184,10 @@ bool loadScenarioOverrides(
                       << " on line " << lineno << std::endl;
             return false;
           }
-          droneBaseAssignments[drone_idx - 1] = static_cast<uint8_t>(base_idx - 1);
+          // v2: drones are not pinned.  Silently accept the directive for
+          // back-compat with v1 scenario files but ignore its effect.
+          (void)drone_idx;
+          (void)base_idx;
         } catch (...) {
           std::cerr << "[Sim] scenarioFile: bad drone_base entry '" << line
                     << "' on line " << lineno << std::endl;
@@ -375,11 +405,11 @@ int main(int argc, char* argv[]) {
   std::vector<std::optional<Vector>> baseOverrides(MAX_BASES);
   std::vector<std::optional<Vector>> droneOverrides(NUM_DRONES);
   std::vector<std::optional<Vector>> anchorOverrides(NUM_ANCHORS);
-  std::vector<uint8_t> droneBaseAssignments(NUM_DRONES, 0);  // default: all drones attached to base[0]
-  std::vector<std::pair<size_t, double>> kills;  // (1-based drone index, kill time in seconds)
+  std::vector<std::pair<size_t, double>> droneKills;   // (1-based drone index, kill time)
+  std::vector<std::pair<size_t, double>> baseKills;    // (1-based base slot, kill time)
   if (!scenarioFile.empty()) {
     if (!loadScenarioOverrides(scenarioFile, baseOverrides, droneOverrides, anchorOverrides,
-                                droneBaseAssignments, kills)) {
+                                droneKills, baseKills)) {
       return 1;
     }
     std::cout << "[Sim] scenarioFile: " << scenarioFile << " applied" << std::endl;
@@ -403,11 +433,11 @@ int main(int argc, char* argv[]) {
     }
   }
 
-  // Validate drone base assignments refer to a defined base.
-  for (size_t i = 0; i < NUM_DRONES; ++i) {
-    if (droneBaseAssignments[i] >= numBases) {
-      std::cerr << "[Sim] scenarioFile: drone" << (i + 1)
-                << "_base=" << (droneBaseAssignments[i] + 1)
+  // Validate base-kill targets.
+  for (const auto& [idx1, at_s] : baseKills) {
+    (void)at_s;
+    if (idx1 < 1 || idx1 > numBases) {
+      std::cerr << "[Sim] scenarioFile: kill_base" << idx1
                 << " but only " << numBases << " base(s) defined\n";
       return 1;
     }
@@ -493,11 +523,13 @@ int main(int argc, char* argv[]) {
     }
   }
 
-  // Register each drone with its assigned base (v1: fixed partition).
+  // v2 roaming: every drone registers every base.  Each drone tracks all
+  // bases and dynamically picks the nearest reachable one per tick.
   for (uint32_t i = 0; i < NUM_DRONES; ++i) {
-    const uint8_t b = droneBaseAssignments[i];
-    drones[i]->setBaseStation(bases[b]->id());
-    bases[b]->registerDrone(drones[i]->id());
+    for (uint32_t b = 0; b < numBases; ++b) {
+      drones[i]->registerBase(bases[b]->id());
+      bases[b]->registerDrone(drones[i]->id());
+    }
   }
 
   // Each base triggers its own floods periodically.
@@ -515,13 +547,22 @@ int main(int argc, char* argv[]) {
     d->start();
   }
 
-  // Schedule mid-simulation kills.  kills[i].first is the 1-based drone index
-  // (drone1..droneNUM_DRONES); already validated by loadScenarioOverrides.
-  for (const auto& [idx1, at_s] : kills) {
+  // Schedule mid-simulation drone kills.
+  for (const auto& [idx1, at_s] : droneKills) {
     const size_t idx0 = idx1 - 1;
     Ns3Drone* drone_ptr = drones[idx0].get();
     Simulator::Schedule(Seconds(at_s), [drone_ptr]() { drone_ptr->kill(); });
     std::cout << "[Sim] scheduled kill: drone=" << idx1 << " at t=" << at_s << "s" << std::endl;
+  }
+
+  // Schedule mid-simulation base kills.  idx1 is 1-based slot over numBases.
+  for (const auto& [idx1, at_s] : baseKills) {
+    const size_t idx0 = idx1 - 1;
+    Ns3BaseStation* base_ptr = bases[idx0].get();
+    Simulator::Schedule(Seconds(at_s), [base_ptr]() { base_ptr->kill(); });
+    std::cout << "[Sim] scheduled kill: base" << idx1
+              << " (id=" << static_cast<int>(base_ptr->id())
+              << ") at t=" << at_s << "s" << std::endl;
   }
 
   std::cout << "[Sim] base coverage=" << maxRangeMeters
@@ -560,7 +601,7 @@ int main(int argc, char* argv[]) {
   // ── 0. Scheduled failures (only if any kills were configured) ──
   // Printed first so later blocks (Healing, Return, FinalCoverage) are read in
   // the context of "we killed drone X at time T".
-  if (!kills.empty()) {
+  if (!droneKills.empty()) {
     std::cout << "\n── Scheduled Failures ──\n";
     std::cout << std::left
               << std::setw(8)  << "Drone"
@@ -569,7 +610,8 @@ int main(int argc, char* argv[]) {
               << "LastGtPos\n";
 
     uint32_t executed = 0;
-    for (const auto& [idx1, at_s] : kills) {
+    for (const auto& [idx1, at_s] : droneKills) {
+      (void)at_s;
       const size_t idx0 = idx1 - 1;
       const auto& d = drones[idx0];
       const double ks = d->killedAtS();
@@ -589,8 +631,39 @@ int main(int argc, char* argv[]) {
                 << std::setw(12) << hops_str
                 << posstr.str() << "\n";
     }
-    std::cout << "Failures: scheduled=" << kills.size()
+    std::cout << "Failures: scheduled=" << droneKills.size()
               << "  executed=" << executed << "\n";
+  }
+
+  // Scheduled base failures — separate block so drone-failure regexes in the
+  // runner don't get confused with base-failure data.
+  if (!baseKills.empty()) {
+    std::cout << "\n── Scheduled Base Failures ──\n";
+    std::cout << std::left
+              << std::setw(8)  << "Base"
+              << std::setw(14) << "KilledAt(s)"
+              << "Pos\n";
+
+    uint32_t bExecuted = 0;
+    for (const auto& [idx1, at_s] : baseKills) {
+      (void)at_s;
+      const size_t idx0 = idx1 - 1;
+      const auto& b = bases[idx0];
+      const double ks = b->killedAtS();
+      const bool ran = (ks >= 0.0);
+      if (ran) ++bExecuted;
+
+      const Vector bp = baseOverrides[idx0].value();
+      std::ostringstream posstr;
+      posstr << "(" << fmtNum(bp.x) << "," << fmtNum(bp.y) << "," << fmtNum(bp.z) << ")";
+
+      std::cout << std::left
+                << std::setw(8)  << static_cast<int>(b->id())
+                << std::setw(14) << (ran ? fmtNum(ks) : std::string("-"))
+                << posstr.str() << "\n";
+    }
+    std::cout << "BaseFailures: scheduled=" << baseKills.size()
+              << "  executed=" << bExecuted << "\n";
   }
 
   // Collect final positions for all drones.
@@ -986,8 +1059,17 @@ int main(int argc, char* argv[]) {
         if (straight > 1e-3) {
           path_eff = path / straight;
         }
-        // Boundary distance measured relative to THIS drone's assigned base.
-        const Vector& assigned_base_pos = baseOverrides[droneBaseAssignments[i]].value();
+        // Boundary distance relative to THIS drone's CURRENT nearest base.
+        // In v2 drones roam; the nearest-base attribution may have changed
+        // since return-complete, but this is still the best post-hoc proxy
+        // for "which base am I parked near".  Fall back to base0 if the
+        // drone's nearest is unknown (UINT8_MAX).
+        const uint8_t nb_id = d->nearestBaseId();
+        size_t nb_slot = 0;
+        for (uint32_t bi = 0; bi < numBases; ++bi) {
+          if (bases[bi]->id() == nb_id) { nb_slot = bi; break; }
+        }
+        const Vector& assigned_base_pos = baseOverrides[nb_slot].value();
         const double bx = end.x - assigned_base_pos.x;
         const double by = end.y - assigned_base_pos.y;
         const double bz = end.z - assigned_base_pos.z;
@@ -1088,7 +1170,19 @@ int main(int argc, char* argv[]) {
       // Coverage bucketing: killed drones get their own bucket and don't count
       // toward the `lost` protocol-failure tally.  Denominator drops by K so a
       // mid-sim kill doesn't make the coverage rate look artificially worse.
-      BaseBucket& bb = per_base[droneBaseAssignments[i]];
+      //
+      // v2 roaming: attribute the drone to its CURRENT nearest base (the
+      // one its hop count is reported against).  Lost / killed drones have
+      // no current base -- attribute them to base slot 0 so the combined
+      // totals add up but be aware per-base "lost" is a rough heuristic.
+      size_t nb_slot = 0;
+      const uint8_t nb_id = d->nearestBaseId();
+      if (nb_id != 0xFF) {
+        for (uint32_t bi = 0; bi < numBases; ++bi) {
+          if (bases[bi]->id() == nb_id) { nb_slot = bi; break; }
+        }
+      }
+      BaseBucket& bb = per_base[nb_slot];
       if (killed) {
         ++dead;
         ++bb.dead;

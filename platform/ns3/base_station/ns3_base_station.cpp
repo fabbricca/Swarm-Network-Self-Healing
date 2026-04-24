@@ -19,7 +19,20 @@ void Ns3BaseStation::start() {
   ::ns3::Simulator::Schedule(::ns3::Seconds(initial_delay_s), ::ns3::MakeCallback(&Ns3BaseStation::onTick, this));
 }
 
+void Ns3BaseStation::kill() {
+  if (!m_alive) return;
+  m_alive = false;
+  m_killed_at_s = ::ns3::Simulator::Now().GetSeconds();
+  std::cout << "[BASE_KILL] t=" << m_killed_at_s
+            << "s base=" << static_cast<int>(m_id) << std::endl;
+}
+
 void Ns3BaseStation::onTick() {
+  if (!m_alive) {
+    // Dead base: stop originating floods.  Do NOT reschedule -- tick chain
+    // ends to save event-queue work.
+    return;
+  }
   if (!m_drone_ids.empty()) {
     // Choose a stable initiator: the lowest registered drone id.
     uint8_t initiator = 0;
@@ -40,13 +53,18 @@ void Ns3BaseStation::registerDrone(uint8_t id) {
 }
 
 void Ns3BaseStation::requestFlood(uint16_t flood_id, uint8_t initiator_drone_id) {
+  (void)initiator_drone_id;  // v2: FloodStart is broadcast; any drone in
+                             // range becomes an initiator.  Broadcasting
+                             // avoids the v1 bug where a base would pick
+                             // an out-of-range drone as initiator and the
+                             // unicast START would never be delivered.
   FloodStartMsg msg;
   msg.flood_id = flood_id;
 
   ::Packet out;
   out.type = ::PacketType::FLOOD;
   out.src = m_id;
-  out.dst = initiator_drone_id;
+  out.dst = BROADCAST_ID;
   out.payload.resize(sizeof(msg));
   std::memcpy(out.payload.data(), &msg, sizeof(msg));
 
@@ -54,6 +72,11 @@ void Ns3BaseStation::requestFlood(uint16_t flood_id, uint8_t initiator_drone_id)
 }
 
 void Ns3BaseStation::dispatchPacket(const ::Packet& pkt) {
+  if (!m_alive) {
+    // Dead base: ignore all incoming traffic.  Specifically, do not answer
+    // POS_UPDATE with POS_ACK -- that's how drones detect the base is gone.
+    return;
+  }
   if (pkt.payload.empty()) {
     return;
   }

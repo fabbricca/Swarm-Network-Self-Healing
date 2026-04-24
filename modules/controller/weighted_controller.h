@@ -12,6 +12,7 @@ class WeightedController : public ControllerBase {
     protected:
         void accumulateAttractive(
             const std::vector<NeighborInfoInterface*>& neighbors,
+            uint8_t self_base_id,
             uint8_t self_hops,
             PositionInterface* self_position,
             Vector3D& F_tot

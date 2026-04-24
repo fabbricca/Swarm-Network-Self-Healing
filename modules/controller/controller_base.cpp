@@ -77,49 +77,48 @@ void ControllerBase::step(
         return;
     }
 
-    // Station-keeping short-circuit: a returned drone sits at the coverage
-    // boundary, brakes explicitly, and keeps advertising as a normal anchor
-    // so helpers can re-anchor against it.
+    // v2 multi-base: every tick we optimize relative to whichever base is
+    // currently nearest.  If no base is reachable, the drone is fully lost
+    // -- the per-base hops vector is empty and every branch below degrades
+    // gracefully (see below).
+    const uint8_t nearest_base = flooding_manager->getNearestBaseId();
+    const uint8_t my_hops = flooding_manager->getNearestBaseHops();
+    const auto my_per_base_hops = flooding_manager->getPerBaseHops();
+
     if (m_station_keeping) {
         velocity_actuator->brake();
         position->retrieveCurrentPosition();
-        const uint8_t hops = flooding_manager->getHopsFromBase();
-        neighbor_manager->sendToNeighbors(self_id, position, hops, /*returning=*/false);
+        neighbor_manager->sendToNeighbors(self_id, position, my_per_base_hops, /*returning=*/false);
         return;
     }
 
     if (!mission_active && m_returning) {
-        // Returning mode: attract toward lower-hop neighbors only, reduced gain.
-        // This follows the relay chain gradient back toward base.
         const auto neighbors = neighbor_manager->getNeighbors();
         position->retrieveCurrentPosition();
-        const uint8_t my_hops = flooding_manager->getHopsFromBase();
 
         Vector3D F_tot{0.0f, 0.0f, 0.0f};
         bool has_attractor = false;
         for (const NeighborInfoInterface* neighbor : neighbors) {
             Vector3D diff = position->distanceFromCoords(neighbor->getPosition());
-            const uint8_t nh = neighbor->getHopsToBaseStation();
+            // Follow the gradient toward our nearest base using neighbors
+            // who claim a lower hop count for THAT base.
+            const uint8_t nh = (nearest_base == UINT8_MAX)
+                ? neighbor->getMinHopsToAnyBase()
+                : neighbor->getHopsToBase(nearest_base);
+            const uint8_t mh = (my_hops == UINT8_MAX) ? 0xFE : my_hops;
 
-            if (nh < my_hops) {
-                // Attraction toward lower-hop neighbors (toward base)
+            if (nh != UINT8_MAX && nh < mh) {
                 F_tot = F_tot + (K_att * RETURN_K_ATT_SCALE * diff);
                 has_attractor = true;
             }
-            // Repulsion from all neighbors (collision avoidance)
             if (diff.module() < D_safe) {
                 computeRepulsiveForces(diff, F_tot);
             }
         }
 
-        // Safety brake: with no lower-hop neighbor visible, we have no gradient
-        // to follow.  Without an explicit brake, applyVelocity(a=0) leaves the
-        // previous velocity intact and the drone coasts off into the distance
-        // indefinitely (it may have just passed through the relay chain and
-        // lost coverage).  Stop and wait for the chain to catch up instead.
         if (!has_attractor) {
             velocity_actuator->brake();
-            neighbor_manager->sendToNeighbors(self_id, position, my_hops, /*returning=*/true);
+            neighbor_manager->sendToNeighbors(self_id, position, my_per_base_hops, /*returning=*/true);
             return;
         }
 
@@ -127,35 +126,28 @@ void ControllerBase::step(
         computeVelocityCommand(F_tot, &new_acceleration);
         velocity_actuator->applyVelocity(new_acceleration, V_max);
 
-        // Keep advertising — with returning=true so helpers drop us from
-        // their attractive centroid (but keep collision avoidance).
-        neighbor_manager->sendToNeighbors(self_id, position, my_hops, /*returning=*/true);
+        neighbor_manager->sendToNeighbors(self_id, position, my_per_base_hops, /*returning=*/true);
         return;
     }
 
     if (!mission_active) {
-        // Brake explicitly so the drone holds position — applying a zero
-        // acceleration only zeroes acceleration, not velocity.
         velocity_actuator->brake();
 
-        // Silence NEIGHBOR only when we're in base coverage (hops==1): an
-        // in-coverage idle drone plays no role in the formation task and
-        // costs a broadcast per tick for nothing.  Lost idle drones (hops>1
-        // or UINT8_MAX) still advertise so helpers can pull toward them.
-        const uint8_t hops = flooding_manager->getHopsFromBase();
-        if (hops != 1) {
+        // Silence NEIGHBOR only when we're in direct base coverage (hops==1):
+        // an in-coverage idle drone plays no role in the formation task.
+        const bool is_hop1 = (my_hops == 1);
+        if (!is_hop1) {
             position->retrieveCurrentPosition();
-            neighbor_manager->sendToNeighbors(self_id, position, hops, /*returning=*/false);
+            neighbor_manager->sendToNeighbors(self_id, position, my_per_base_hops, /*returning=*/false);
         }
         return;
     }
 
     const auto neighbors = neighbor_manager->getNeighbors();
     position->retrieveCurrentPosition();
-    const uint8_t hops_from_base_station = flooding_manager->getHopsFromBase();
 
     Vector3D F_tot{0.0f, 0.0f, 0.0f};
-    accumulateAttractive(neighbors, hops_from_base_station, position, F_tot);
+    accumulateAttractive(neighbors, nearest_base, my_hops, position, F_tot);
 
     for (const NeighborInfoInterface* neighbor : neighbors) {
         Vector3D diff = position->distanceFromCoords(neighbor->getPosition());
@@ -164,20 +156,9 @@ void ControllerBase::step(
         }
     }
 
-    // Safety brake: if we have no neighbors, or the accumulated force is
-    // essentially zero (e.g. weighted controller where one hop-side vanished
-    // so the cross-product weight collapses to 0), applyVelocity(a=0)
-    // preserves the previous velocity and the drone coasts at V_max
-    // indefinitely until the sim ends — taking it 100s of meters out of
-    // formation and blowing up trilateration.  Brake instead.
     if (neighbors.empty() || F_tot.module() < 1e-6f) {
         velocity_actuator->brake();
-        neighbor_manager->sendToNeighbors(
-            self_id,
-            position,
-            hops_from_base_station,
-            /*returning=*/false
-        );
+        neighbor_manager->sendToNeighbors(self_id, position, my_per_base_hops, /*returning=*/false);
         return;
     }
 
@@ -185,10 +166,5 @@ void ControllerBase::step(
     computeVelocityCommand(F_tot, &new_acceleration);
     velocity_actuator->applyVelocity(new_acceleration, V_max);
 
-    neighbor_manager->sendToNeighbors(
-        self_id,
-        position,
-        hops_from_base_station,
-        /*returning=*/false
-    );
+    neighbor_manager->sendToNeighbors(self_id, position, my_per_base_hops, /*returning=*/false);
 }

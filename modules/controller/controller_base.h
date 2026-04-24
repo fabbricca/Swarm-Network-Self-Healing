@@ -46,8 +46,15 @@ class ControllerBase : public ControllerInterface {
         // Template-method hook: subclass accumulates attractive forces from
         // the neighbor list into F_tot.  Repulsion and velocity integration
         // are handled by the base class.
+        //
+        // v2 multi-base: the base class picks the nearest base per tick and
+        // passes its id through to the subclass so it queries neighbors
+        // against the correct base dimension.  Neighbors that have no known
+        // path to `self_base_id` should be skipped (getHopsToBase returns
+        // UINT8_MAX).
         virtual void accumulateAttractive(
             const std::vector<NeighborInfoInterface*>& neighbors,
+            uint8_t self_base_id,
             uint8_t self_hops,
             PositionInterface* self_position,
             Vector3D& F_tot

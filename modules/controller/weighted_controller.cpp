@@ -4,27 +4,37 @@
 
 void WeightedController::accumulateAttractive(
     const std::vector<NeighborInfoInterface*>& neighbors,
+    uint8_t self_base_id,
     uint8_t self_hops,
     PositionInterface* self_position,
     Vector3D& F_tot
 ) {
-    // Count lower/higher-hop neighbors first so each side can be scaled by
-    // the OTHER side's cardinality.  Without this, N higher-hop drones pull
-    // N times harder than a single base, shifting the equilibrium off the
-    // midpoint.  In the common case N_lower=1 this reduces to "weigh the
-    // base as many times as the higher-hop drones heard".
-    // Skip drones currently returning: they are not valid formation anchors.
+    // Count lower/higher-hop neighbors relative to OUR nearest base so each
+    // side can be scaled by the opposing side's cardinality.
+    //
+    // v2 multi-base: every per-neighbor hop query is against self_base_id so
+    // neighbors attached to other bases don't bias the count.  If we have
+    // no nearest base (UINT8_MAX), fall back to min-hops-to-any-base so
+    // the drone still gets some gradient signal.
+    auto hop_to_our_base = [&](const NeighborInfoInterface* n) -> uint8_t {
+        return (self_base_id == UINT8_MAX)
+            ? n->getMinHopsToAnyBase()
+            : n->getHopsToBase(self_base_id);
+    };
+
     uint32_t n_lower = 0, n_higher = 0;
     for (const NeighborInfoInterface* neighbor : neighbors) {
         if (neighbor->getIsReturning()) continue;
-        const uint8_t nh = neighbor->getHopsToBaseStation();
+        const uint8_t nh = hop_to_our_base(neighbor);
+        if (nh == UINT8_MAX) continue;
         if (nh < self_hops)      ++n_lower;
         else if (nh > self_hops) ++n_higher;
     }
 
     for (const NeighborInfoInterface* neighbor : neighbors) {
         if (neighbor->getIsReturning()) continue;
-        const uint8_t neighbor_hops = neighbor->getHopsToBaseStation();
+        const uint8_t neighbor_hops = hop_to_our_base(neighbor);
+        if (neighbor_hops == UINT8_MAX) continue;
         Vector3D diff = self_position->distanceFromCoords(neighbor->getPosition());
         if (neighbor_hops < self_hops) {
             for (uint32_t i = 0; i < n_higher; ++i) {

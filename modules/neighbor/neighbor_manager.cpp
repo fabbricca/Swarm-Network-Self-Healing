@@ -6,25 +6,40 @@ NeighborManager::NeighborManager(
     m_communication_manager(communication_manager) 
 { }
 
+void NeighborManager::setBaseId(uint8_t base_id) {
+    m_base_id = base_id;
+    m_has_base_id = true;
+}
+
 void NeighborManager::onPacketReceived(const ::Packet& pkt) {
     if (pkt.type != ::PacketType::NEIGHBOR) {
         return;
     }
-    if (pkt.payload.size() < 3) {
+    if (pkt.payload.size() < 4) {
         return;
     }
 
-    // Payload format: [neighbor_id][hops][flags][double coords...]
+    // Payload format: [neighbor_id][base_id][hops][flags][double coords...]
     const uint8_t neighbor_id = pkt.payload[0];
     if (neighbor_id != pkt.src) {
         // Basic sanity check: outer header src should match payload id.
         return;
     }
 
-    const uint8_t hops = pkt.payload[1];
-    const uint8_t flags = pkt.payload[2];
+    const uint8_t sender_base_id = pkt.payload[1];
+
+    // v1 multi-base partition: discard neighbors attached to a different
+    // base.  Prevents hop-count cross-pollination between isolated swarms.
+    // Exception: if we haven't registered a base yet, accept anything
+    // (bootstrap window before setBaseStation is called).
+    if (m_has_base_id && sender_base_id != m_base_id) {
+        return;
+    }
+
+    const uint8_t hops = pkt.payload[2];
+    const uint8_t flags = pkt.payload[3];
     const bool returning = (flags & NeighborInfo::FLAG_RETURNING) != 0;
-    const size_t coord_bytes = pkt.payload.size() - 3;
+    const size_t coord_bytes = pkt.payload.size() - 4;
     if (coord_bytes % sizeof(double) != 0) {
         return;
     }
@@ -32,11 +47,11 @@ void NeighborManager::onPacketReceived(const ::Packet& pkt) {
     std::vector<double> coords;
     coords.resize(coord_bytes / sizeof(double));
     if (coord_bytes > 0) {
-        std::memcpy(coords.data(), pkt.payload.data() + 3, coord_bytes);
+        std::memcpy(coords.data(), pkt.payload.data() + 4, coord_bytes);
     }
 
     auto& entry = m_neighbors[neighbor_id];
-    entry.info = std::make_unique<NeighborInfo>(neighbor_id, hops, returning, coords);
+    entry.info = std::make_unique<NeighborInfo>(neighbor_id, sender_base_id, hops, returning, coords);
     entry.last_seen_call = m_call_count;
 }
 
@@ -95,7 +110,7 @@ void NeighborManager::sendToNeighbors(
         }
     }
 
-    NeighborInfo info(id, hops_to_base_station, returning, coords);
+    NeighborInfo info(id, m_base_id, hops_to_base_station, returning, coords);
 
     ::Packet pkt;
     pkt.type = ::PacketType::NEIGHBOR;

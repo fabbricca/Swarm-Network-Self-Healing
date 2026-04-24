@@ -195,6 +195,12 @@ class Scenario:
     anchors: dict[int, Vec3]
     params: dict[str, float]
     failures: list[tuple[int, float]] = field(default_factory=list)
+    # v1 multi-base: up to 3 base positions (index 1-based in scenario file).
+    # When `bases` is non-empty it supersedes `base_station` / defaults.
+    bases: list[Vec3] = field(default_factory=list)
+    # Optional per-drone base assignment: drone_idx (1-based) -> base_idx (1-based).
+    # Missing entries default to base 1.
+    drone_base: dict[int, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -204,6 +210,8 @@ class ScenarioDefaults:
     anchors: dict[int, Vec3]
     params: dict[str, float]
     failures: list[tuple[int, float]] = field(default_factory=list)
+    bases: list[Vec3] = field(default_factory=list)
+    drone_base: dict[int, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -345,6 +353,44 @@ def parse_position_block(value: Any, where: str, parse_index) -> dict[int, Vec3]
     raise DeclarationError(f"{where}: expected list or dict")
 
 
+MAX_BASES = 3  # matches the C++ side (apps/help_proxy_sim.cpp).
+
+
+def parse_bases_block(value: Any, where: str) -> list[Vec3]:
+    """Parse an optional list of base-station positions (1..MAX_BASES)."""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise DeclarationError(f"{where}: expected a list of base positions")
+    if len(value) > MAX_BASES:
+        raise DeclarationError(f"{where}: at most {MAX_BASES} bases supported")
+    out: list[Vec3] = []
+    for i, item in enumerate(value):
+        out.append(parse_vec3(item, f"{where}[{i}]"))
+    return out
+
+
+def parse_drone_base_block(value: Any, where: str) -> dict[int, int]:
+    """Parse drone -> base assignment (both 1-based).
+
+    Accepts dicts like {"drone3": 2, "drone5": 1} or {"3": 2}.
+    """
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise DeclarationError(f"{where}: expected an object mapping drone -> base index")
+    out: dict[int, int] = {}
+    for raw_key, raw_val in value.items():
+        drone_idx = parse_drone_index(raw_key, f"{where}.{raw_key}")
+        base_idx = as_int(raw_val, f"{where}.{raw_key}")
+        if base_idx < 1 or base_idx > MAX_BASES:
+            raise DeclarationError(
+                f"{where}.{raw_key}: base index {base_idx} out of range 1..{MAX_BASES}"
+            )
+        out[drone_idx] = base_idx
+    return out
+
+
 def parse_failures_block(value: Any, where: str) -> list[tuple[int, float]]:
     if value is None:
         return []
@@ -443,6 +489,8 @@ def parse_defaults(raw: dict[str, Any]) -> ScenarioDefaults:
         anchors=parse_position_block(defaults.get("anchors"), "defaults.anchors", parse_anchor_index),
         params={**DEFAULT_PARAMS, **extract_params(defaults, "defaults")},
         failures=parse_failures_block(defaults.get("failures"), "defaults.failures"),
+        bases=parse_bases_block(defaults.get("bases"), "defaults.bases"),
+        drone_base=parse_drone_base_block(defaults.get("drone_base"), "defaults.drone_base"),
     )
 
 
@@ -467,6 +515,8 @@ def dedupe_scenario_names(scenarios: list[Scenario]) -> list[Scenario]:
                 anchors=scenario.anchors,
                 params=scenario.params,
                 failures=scenario.failures,
+                bases=scenario.bases,
+                drone_base=scenario.drone_base,
             )
         )
     return out
@@ -506,6 +556,23 @@ def normalize_scenarios(raw: dict[str, Any]) -> list[Scenario]:
         failures = list(scenario_defaults.failures)
         failures.extend(parse_failures_block(entry.get("failures"), f"{where}.failures"))
 
+        # Multi-base: scenario-level bases override defaults entirely when
+        # present (merging two lists-of-positions doesn't compose sensibly).
+        entry_bases = parse_bases_block(entry.get("bases"), f"{where}.bases")
+        bases = entry_bases if entry_bases else list(scenario_defaults.bases)
+
+        drone_base = dict(scenario_defaults.drone_base)
+        drone_base.update(parse_drone_base_block(entry.get("drone_base"), f"{where}.drone_base"))
+
+        # Cross-validate: every drone_base reference must fit within configured bases.
+        base_count = len(bases) if bases else 1
+        for drone_idx, base_idx in drone_base.items():
+            if base_idx > base_count:
+                raise DeclarationError(
+                    f"{where}.drone_base.drone{drone_idx}: base index {base_idx} "
+                    f"exceeds configured base count {base_count}"
+                )
+
         raw_name = entry.get("name", f"sim_{i:03d}")
         name = slugify(str(raw_name)) or f"sim_{i:03d}"
 
@@ -517,6 +584,8 @@ def normalize_scenarios(raw: dict[str, Any]) -> list[Scenario]:
                 anchors=anchors,
                 params=params,
                 failures=failures,
+                bases=bases,
+                drone_base=drone_base,
             )
         )
 
@@ -527,6 +596,8 @@ def scenario_to_json_dict(scenario: Scenario) -> dict[str, Any]:
     return {
         "name": scenario.name,
         "base_station": list(scenario.base_station) if scenario.base_station is not None else None,
+        "bases": [list(b) for b in scenario.bases],
+        "drone_base": {f"drone{k}": v for k, v in sorted(scenario.drone_base.items())},
         "drones": {f"drone{k}": list(v) for k, v in sorted(scenario.drones.items())},
         "anchors": {f"anchor{k}": list(v) for k, v in sorted(scenario.anchors.items())},
         "params": scenario.params,
@@ -544,7 +615,12 @@ def write_override_file(path: Path, scenario: Scenario) -> None:
     lines.append("# Generated by scripts/run_declaration.py")
     lines.append(f"# scenario={scenario.name}")
 
-    if scenario.base_station is not None:
+    if scenario.bases:
+        # Multi-base form: emit each base explicitly.  The legacy 'base=' key
+        # is dropped so the C++ parser doesn't see both forms.
+        for i, (x, y, z) in enumerate(scenario.bases, start=1):
+            lines.append(f"base{i}={x:.6f},{y:.6f},{z:.6f}")
+    elif scenario.base_station is not None:
         x, y, z = scenario.base_station
         lines.append(f"base={x:.6f},{y:.6f},{z:.6f}")
 
@@ -555,6 +631,9 @@ def write_override_file(path: Path, scenario: Scenario) -> None:
     for idx in sorted(scenario.anchors):
         x, y, z = scenario.anchors[idx]
         lines.append(f"anchor{idx}={x:.6f},{y:.6f},{z:.6f}")
+
+    for drone_idx in sorted(scenario.drone_base):
+        lines.append(f"drone{drone_idx}_base={scenario.drone_base[drone_idx]}")
 
     for idx, at_s in sorted(scenario.failures):
         lines.append(f"kill_drone{idx}={at_s:.6f}")

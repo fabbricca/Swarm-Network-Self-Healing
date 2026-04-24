@@ -37,18 +37,28 @@ void EnsureMobility(Ptr<Node> node, const Vector& pos) {
   mob->SetPosition(pos);
 }
 
+// Multi-base partition: v1 supports up to 3 bases.  Base 1 uses id 0 (legacy
+// single-base value), bases 2/3 use ids 250/251 so they never collide with
+// drone or anchor ids (drones 1..20, anchors 21..38).
+constexpr size_t MAX_BASES = 3;
+constexpr uint8_t BASE_IDS[MAX_BASES] = {0, 250, 251};
+
 // Parse an optional override file of the form:
 //   # comments allowed
-//   base=x,y,z
-//   droneN=x,y,z    (N in 1..NUM_DRONES)
-//   anchorN=x,y,z   (N in 1..NUM_ANCHORS)
+//   base=x,y,z                 (alias for base1=)
+//   baseN=x,y,z                (N in 1..MAX_BASES)
+//   droneN=x,y,z               (N in 1..NUM_DRONES)
+//   droneN_base=M              (assign drone N to base M, 1..MAX_BASES)
+//   anchorN=x,y,z              (N in 1..NUM_ANCHORS)
+//   kill_droneN=T              (schedule mid-sim drone kill)
 // Missing keys keep the simulator's hardcoded defaults. Unknown keys are
 // treated as hard errors so typos can't silently no-op.
 bool loadScenarioOverrides(
     const std::string& path,
-    std::optional<Vector>& baseOverride,
+    std::vector<std::optional<Vector>>& baseOverrides,
     std::vector<std::optional<Vector>>& droneOverrides,
     std::vector<std::optional<Vector>>& anchorOverrides,
+    std::vector<uint8_t>& droneBaseAssignments,
     std::vector<std::pair<size_t, double>>& kills) {
   std::ifstream in(path);
   if (!in.is_open()) {
@@ -58,6 +68,7 @@ bool loadScenarioOverrides(
 
   const size_t numDrones = droneOverrides.size();
   const size_t numAnchors = anchorOverrides.size();
+  const size_t numBases = baseOverrides.size();
 
   auto parseVec = [&](const std::string& value, Vector& out, const std::string& line) -> bool {
     double coords[3] = {0.0, 0.0, 0.0};
@@ -125,11 +136,57 @@ bool loadScenarioOverrides(
       continue;
     }
 
+    // droneN_base=M has a scalar RHS (base index, 1..numBases) — handle
+    // before the droneN= prefix check so the RHS isn't parsed as a vec3.
+    {
+      const size_t under = key.find('_');
+      if (under != std::string::npos
+          && key.rfind("drone", 0) == 0
+          && key.substr(under) == "_base") {
+        try {
+          const size_t drone_idx = static_cast<size_t>(std::stoul(key.substr(5, under - 5)));
+          if (drone_idx < 1 || drone_idx > numDrones) {
+            std::cerr << "[Sim] scenarioFile: drone index " << drone_idx
+                      << " out of range 1.." << numDrones << " on line " << lineno << std::endl;
+            return false;
+          }
+          const size_t base_idx = static_cast<size_t>(std::stoul(val));
+          if (base_idx < 1 || base_idx > numBases) {
+            std::cerr << "[Sim] scenarioFile: drone base assignment "
+                      << base_idx << " out of range 1.." << numBases
+                      << " on line " << lineno << std::endl;
+            return false;
+          }
+          droneBaseAssignments[drone_idx - 1] = static_cast<uint8_t>(base_idx - 1);
+        } catch (...) {
+          std::cerr << "[Sim] scenarioFile: bad drone_base entry '" << line
+                    << "' on line " << lineno << std::endl;
+          return false;
+        }
+        continue;
+      }
+    }
+
     Vector pos;
     if (!parseVec(val, pos, line)) return false;
 
     if (key == "base") {
-      baseOverride = pos;
+      // Legacy single-base alias.
+      baseOverrides[0] = pos;
+    } else if (key.rfind("base", 0) == 0 && key.size() > 4
+               && std::all_of(key.begin() + 4, key.end(), ::isdigit)) {
+      try {
+        size_t idx = static_cast<size_t>(std::stoul(key.substr(4)));
+        if (idx < 1 || idx > numBases) {
+          std::cerr << "[Sim] scenarioFile: base index " << idx
+                    << " out of range 1.." << numBases << " on line " << lineno << std::endl;
+          return false;
+        }
+        baseOverrides[idx - 1] = pos;
+      } catch (...) {
+        std::cerr << "[Sim] scenarioFile: bad base key '" << key << "' on line " << lineno << std::endl;
+        return false;
+      }
     } else if (key.rfind("drone", 0) == 0) {
       try {
         size_t idx = static_cast<size_t>(std::stoul(key.substr(5)));
@@ -315,49 +372,90 @@ int main(int argc, char* argv[]) {
     {  37.50, -64.95, 0.0},   // A18 (300°)
   };
 
-  std::optional<Vector> baseOverride;
+  std::vector<std::optional<Vector>> baseOverrides(MAX_BASES);
   std::vector<std::optional<Vector>> droneOverrides(NUM_DRONES);
   std::vector<std::optional<Vector>> anchorOverrides(NUM_ANCHORS);
+  std::vector<uint8_t> droneBaseAssignments(NUM_DRONES, 0);  // default: all drones attached to base[0]
   std::vector<std::pair<size_t, double>> kills;  // (1-based drone index, kill time in seconds)
   if (!scenarioFile.empty()) {
-    if (!loadScenarioOverrides(scenarioFile, baseOverride, droneOverrides, anchorOverrides, kills)) {
+    if (!loadScenarioOverrides(scenarioFile, baseOverrides, droneOverrides, anchorOverrides,
+                                droneBaseAssignments, kills)) {
       return 1;
     }
     std::cout << "[Sim] scenarioFile: " << scenarioFile << " applied" << std::endl;
   }
 
+  // Single-base legacy path: if nothing configured, keep the compiled-in default.
+  if (!baseOverrides[0].has_value()) {
+    baseOverrides[0] = baseDefault;
+  }
+
+  // Count active bases (contiguous from slot 0; no gaps allowed).
+  uint32_t numBases = 0;
+  for (size_t i = 0; i < MAX_BASES; ++i) {
+    if (baseOverrides[i].has_value()) {
+      if (numBases != i) {
+        std::cerr << "[Sim] scenarioFile: base" << (i + 1)
+                  << " defined but base" << numBases + 1 << " is not — bases must be contiguous\n";
+        return 1;
+      }
+      ++numBases;
+    }
+  }
+
+  // Validate drone base assignments refer to a defined base.
+  for (size_t i = 0; i < NUM_DRONES; ++i) {
+    if (droneBaseAssignments[i] >= numBases) {
+      std::cerr << "[Sim] scenarioFile: drone" << (i + 1)
+                << "_base=" << (droneBaseAssignments[i] + 1)
+                << " but only " << numBases << " base(s) defined\n";
+      return 1;
+    }
+  }
+
   NodeContainer nodes;
-  nodes.Create(1 + NUM_DRONES + NUM_ANCHORS);
-  // node 0: base station (also UWB anchor)
-  // node 1..10: drones
-  // node 11..22: standalone UWB anchors
+  nodes.Create(numBases + NUM_DRONES + NUM_ANCHORS);
+  // Node layout:
+  //   [0 .. numBases-1]:                             base stations
+  //   [numBases .. numBases+NUM_DRONES-1]:           drones
+  //   [numBases+NUM_DRONES .. +NUM_ANCHORS-1]:       standalone UWB anchors
 
-  // Base station
-  EnsureMobility(nodes.Get(0), baseOverride.value_or(baseDefault));
+  // Base stations: each at its own node, ids from BASE_IDS[].
+  for (uint32_t b = 0; b < numBases; ++b) {
+    EnsureMobility(nodes.Get(b), baseOverrides[b].value());
+  }
 
-  // Drones 1-10: positions come from override when present, else the default.
+  // Drones: positions from override when present, else the default.
   // Snapshot initial positions for the end-of-sim displacement table.
   std::vector<Vector> initialDronePos(NUM_DRONES);
   for (uint32_t i = 0; i < NUM_DRONES; ++i) {
     initialDronePos[i] = droneOverrides[i].value_or(droneDefaults[i]);
-    EnsureMobility(nodes.Get(i + 1), initialDronePos[i]);
+    EnsureMobility(nodes.Get(numBases + i), initialDronePos[i]);
   }
 
-  // UWB anchors (nodes 11-22): positions come from override when present, else default.
+  // UWB anchors: positions from override when present, else default.
   for (uint32_t i = 0; i < NUM_ANCHORS; ++i) {
-    EnsureMobility(nodes.Get(NUM_DRONES + 1 + i), anchorOverrides[i].value_or(anchorDefaults[i]));
+    EnsureMobility(nodes.Get(numBases + NUM_DRONES + i), anchorOverrides[i].value_or(anchorDefaults[i]));
   }
 
-  Vector basePosVec = baseOverride.value_or(baseDefault);
-  Ns3BaseStation base(0, nodes.Get(0));
-  base.setPosition(basePosVec.x, basePosVec.y, basePosVec.z);
+  std::vector<std::unique_ptr<Ns3BaseStation>> bases;
+  bases.reserve(numBases);
+  for (uint32_t b = 0; b < numBases; ++b) {
+    const Vector bp = baseOverrides[b].value();
+    bases.push_back(std::make_unique<Ns3BaseStation>(BASE_IDS[b], nodes.Get(b)));
+    bases.back()->setPosition(bp.x, bp.y, bp.z);
+  }
 
   // Create standalone UWB anchors.
   std::vector<std::unique_ptr<Ns3UwbAnchor>> anchors;
   anchors.reserve(NUM_ANCHORS);
   for (uint32_t i = 0; i < NUM_ANCHORS; ++i) {
-    uint8_t anchor_id = static_cast<uint8_t>(NUM_DRONES + 1 + i);  // IDs 11..22
-    anchors.push_back(std::make_unique<Ns3UwbAnchor>(anchor_id, nodes.Get(NUM_DRONES + 1 + i)));
+    // Anchor IDs must stay clear of drone IDs (1..NUM_DRONES) AND the
+    // high-range base IDs (BASE_IDS).  We keep the historical scheme
+    // NUM_DRONES+1..NUM_DRONES+NUM_ANCHORS which never collides with drones
+    // or with our chosen BASE_IDS of 0 / 250 / 251.
+    uint8_t anchor_id = static_cast<uint8_t>(NUM_DRONES + 1 + i);
+    anchors.push_back(std::make_unique<Ns3UwbAnchor>(anchor_id, nodes.Get(numBases + NUM_DRONES + i)));
     Vector ap = anchorOverrides[i].value_or(anchorDefaults[i]);
     anchors.back()->setPosition(ap.x, ap.y, ap.z);
   }
@@ -377,9 +475,11 @@ int main(int argc, char* argv[]) {
   }
 
   for (uint32_t i = 0; i < NUM_DRONES; ++i) {
+    // Drone IDs remain 1..NUM_DRONES (not shifted by numBases) to keep
+    // existing id-based heuristics intact.
     drones.push_back(std::make_unique<Ns3Drone>(
       static_cast<uint8_t>(i + 1),
-      nodes.Get(i + 1),
+      nodes.Get(numBases + i),
       algorithm,
       static_cast<float>(kAtt),
       static_cast<float>(kRep),
@@ -393,14 +493,17 @@ int main(int argc, char* argv[]) {
     }
   }
 
-  // Register peers (no mission forcing here; just wiring IDs).
+  // Register each drone with its assigned base (v1: fixed partition).
   for (uint32_t i = 0; i < NUM_DRONES; ++i) {
-    drones[i]->setBaseStation(base.id());
-    base.registerDrone(drones[i]->id());
+    const uint8_t b = droneBaseAssignments[i];
+    drones[i]->setBaseStation(bases[b]->id());
+    bases[b]->registerDrone(drones[i]->id());
   }
 
-  // Base station triggers floods periodically (unicast START to initiator).
-  base.start();
+  // Each base triggers its own floods periodically.
+  for (const auto& b : bases) {
+    b->start();
+  }
 
   // Start standalone UWB anchor beacon broadcasting.
   for (const auto& a : anchors) {
@@ -422,7 +525,8 @@ int main(int argc, char* argv[]) {
   }
 
   std::cout << "[Sim] base coverage=" << maxRangeMeters
-            << "m, drones=" << NUM_DRONES
+            << "m, bases=" << numBases
+            << ", drones=" << NUM_DRONES
             << ", uwb_anchors=" << NUM_ANCHORS
             << ", stop=" << simSeconds << "s" << std::endl;
 
@@ -432,14 +536,17 @@ int main(int argc, char* argv[]) {
   uint32_t droneIcon = anim.AddResource("drone.png");
   uint32_t uwbAnchorIcon = anim.AddResource("uwbAnchor.png");
 
-  anim.UpdateNodeImage(0, baseStationIcon);
-  anim.UpdateNodeSize(0, 10, 10);
-  for (uint32_t i = 1; i <= NUM_DRONES; ++i) {
-    anim.UpdateNodeImage(i, droneIcon);
-    anim.UpdateNodeSize(i, 10, 10);
+  for (uint32_t b = 0; b < numBases; ++b) {
+    anim.UpdateNodeImage(b, baseStationIcon);
+    anim.UpdateNodeSize(b, 10, 10);
+  }
+  for (uint32_t i = 0; i < NUM_DRONES; ++i) {
+    const uint32_t nodeIdx = numBases + i;
+    anim.UpdateNodeImage(nodeIdx, droneIcon);
+    anim.UpdateNodeSize(nodeIdx, 10, 10);
   }
   for (uint32_t i = 0; i < NUM_ANCHORS; ++i) {
-    uint32_t nodeIdx = NUM_DRONES + 1 + i;
+    const uint32_t nodeIdx = numBases + NUM_DRONES + i;
     anim.UpdateNodeImage(nodeIdx, uwbAnchorIcon);
     anim.UpdateNodeSize(nodeIdx, 6, 6);
   }
@@ -492,7 +599,7 @@ int main(int argc, char* argv[]) {
   double total_error = 0.0, min_error = std::numeric_limits<double>::max(), max_error = 0.0;
 
   for (uint32_t i = 0; i < NUM_DRONES; ++i) {
-    auto mob = nodes.Get(i + 1)->GetObject<ConstantPositionMobilityModel>();
+    auto mob = nodes.Get(numBases + i)->GetObject<ConstantPositionMobilityModel>();
     Vector gt = mob->GetPosition();
     auto* pos = drones[i]->position();
     std::vector<double> tri = pos ? pos->getCoordinates() : std::vector<double>{0.0, 0.0, 0.0};
@@ -879,9 +986,11 @@ int main(int argc, char* argv[]) {
         if (straight > 1e-3) {
           path_eff = path / straight;
         }
-        const double bx = end.x - basePosVec.x;
-        const double by = end.y - basePosVec.y;
-        const double bz = end.z - basePosVec.z;
+        // Boundary distance measured relative to THIS drone's assigned base.
+        const Vector& assigned_base_pos = baseOverrides[droneBaseAssignments[i]].value();
+        const double bx = end.x - assigned_base_pos.x;
+        const double by = end.y - assigned_base_pos.y;
+        const double bz = end.z - assigned_base_pos.z;
         boundary = std::sqrt(bx * bx + by * by + bz * bz);
       }
       const uint32_t rearm = d->rearmCount();
@@ -950,6 +1059,14 @@ int main(int argc, char* argv[]) {
     std::vector<double> drifts;
     uint32_t hops1 = 0, hops2 = 0, hops3plus = 0, lost_hop = 0, covered = 0, dead = 0;
 
+    // Per-base coverage bucketing (v1 multi-base).  Each drone is pinned to a
+    // base, so its FinalHops are already relative to that base.  We tally
+    // independently per base so the end-of-sim report can attribute coverage.
+    struct BaseBucket {
+      uint32_t hops1 = 0, hops2 = 0, hops3plus = 0, lost_hop = 0, covered = 0, dead = 0;
+    };
+    std::vector<BaseBucket> per_base(numBases);
+
     for (uint32_t i = 0; i < NUM_DRONES; ++i) {
       const auto& d = drones[i];
       const bool killed = (d->killedAtS() >= 0.0);
@@ -971,15 +1088,19 @@ int main(int argc, char* argv[]) {
       // Coverage bucketing: killed drones get their own bucket and don't count
       // toward the `lost` protocol-failure tally.  Denominator drops by K so a
       // mid-sim kill doesn't make the coverage rate look artificially worse.
+      BaseBucket& bb = per_base[droneBaseAssignments[i]];
       if (killed) {
         ++dead;
+        ++bb.dead;
       } else if (h == 0xFF) {
         ++lost_hop;
+        ++bb.lost_hop;
       } else {
         ++covered;
-        if (h == 1) ++hops1;
-        else if (h == 2) ++hops2;
-        else if (h >= 3) ++hops3plus;
+        ++bb.covered;
+        if (h == 1)      { ++hops1; ++bb.hops1; }
+        else if (h == 2) { ++hops2; ++bb.hops2; }
+        else if (h >= 3) { ++hops3plus; ++bb.hops3plus; }
       }
     }
 
@@ -995,6 +1116,8 @@ int main(int argc, char* argv[]) {
     }
     std::cout << "\n";
 
+    // Combined coverage line (unchanged format — load-bearing for the
+    // declaration runner's regex).
     std::cout << "FinalCoverage: covered=" << covered
               << "  total=" << denom
               << "  rate=" << fmtNum(cov_rate, 1) << "%"
@@ -1003,6 +1126,25 @@ int main(int argc, char* argv[]) {
               << "  hops3plus=" << hops3plus
               << "  lost=" << lost_hop
               << "  dead=" << dead << "\n";
+
+    // Per-base breakdown, additive — emitted only when more than one base is
+    // configured.  The single-base output stays byte-identical.
+    if (numBases > 1) {
+      for (uint32_t b = 0; b < numBases; ++b) {
+        const BaseBucket& bb = per_base[b];
+        uint32_t assigned = bb.covered + bb.lost_hop + bb.dead;
+        const uint32_t base_denom = assigned - bb.dead;
+        const double base_rate = (base_denom > 0) ? (100.0 * bb.covered / base_denom) : 0.0;
+        std::cout << "FinalCoverage[base=" << b << "]: covered=" << bb.covered
+                  << "  total=" << base_denom
+                  << "  rate=" << fmtNum(base_rate, 1) << "%"
+                  << "  hops1=" << bb.hops1
+                  << "  hops2=" << bb.hops2
+                  << "  hops3plus=" << bb.hops3plus
+                  << "  lost=" << bb.lost_hop
+                  << "  dead=" << bb.dead << "\n";
+      }
+    }
   }
 
   // ── 9. Per-helper midpoint convergence ──

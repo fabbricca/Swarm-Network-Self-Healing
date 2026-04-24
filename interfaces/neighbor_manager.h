@@ -11,6 +11,7 @@ class NeighborManagerInterface {
         virtual ~NeighborManagerInterface() = default;
         virtual void onPacketReceived(const ::Packet& pkt) = 0;
         virtual std::vector<NeighborInfoInterface*> getNeighbors() const = 0;
+        virtual void setBaseId(uint8_t base_id) = 0;
         virtual void sendToNeighbors(
             uint8_t id,
             PositionInterface* position,

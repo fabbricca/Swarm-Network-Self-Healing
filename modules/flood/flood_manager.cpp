@@ -77,6 +77,7 @@ uint8_t FloodManager::getHopsFromBase() const {
 void FloodManager::startFlood(uint16_t flood_id) {
     // Initiator seeds the flood.
     FloodDiscoveryMsg msg;
+    msg.base_id = base_id;
     msg.flood_id = flood_id;
     msg.initiator_id = self_id;
     // The initiator IS 1 hop from base.  Broadcast this actual hop count so
@@ -107,6 +108,12 @@ void FloodManager::handleStart(const FloodStartMsg& msg) {
 }
 
 void FloodManager::handleDiscovery(const FloodDiscoveryMsg& msg) {
+    // Multi-base partition: ignore discovery from a base this node isn't
+    // attached to.  Prevents cross-swarm hop-count contamination.
+    if (msg.base_id != base_id) {
+        return;
+    }
+
     const uint16_t flood_id = msg.flood_id;
     const uint8_t initiator_id = msg.initiator_id;
 
@@ -142,6 +149,11 @@ void FloodManager::handleDiscovery(const FloodDiscoveryMsg& msg) {
 }
 
 void FloodManager::handleReport(const FloodReportMsg& msg) {
+    // Multi-base partition: discard reports for other bases.
+    if (msg.base_id != base_id) {
+        return;
+    }
+
     // Ignore reports for floods we never joined (limits propagation scope).
     if (!seen_floods.count(msg.flood_id)) {
         return;
@@ -168,6 +180,7 @@ void FloodManager::handleReport(const FloodReportMsg& msg) {
 ::Packet FloodManager::createReportMsg(uint16_t flood_id, uint8_t initiator_id, uint8_t candidate_hop) {
     // Create a report with the best hop we currently know.
     FloodReportMsg report;
+    report.base_id = base_id;
     report.flood_id = flood_id;
     report.initiator_id = initiator_id;
     report.reporter_id = self_id;
@@ -185,6 +198,7 @@ void FloodManager::handleReport(const FloodReportMsg& msg) {
 ::Packet FloodManager::createDiscoveryMsg(uint16_t flood_id, uint8_t initiator_id, uint8_t hop_to_base) {
     // Create a discovery message to rebroadcast.
     FloodDiscoveryMsg msg;
+    msg.base_id = base_id;
     msg.flood_id = flood_id;
     msg.initiator_id = initiator_id;
     msg.hop_to_base = hop_to_base;

@@ -11,15 +11,17 @@ enum class NeighborMsgType : uint8_t {
 };
 
 class NeighborInfo : public NeighborInfoInterface {
-    public: 
+    public:
         NeighborInfo(
             uint8_t id,
+            uint8_t base_id,
             uint8_t hops,
             bool returning,
             const std::vector<double>& coordinates
         );
 
         std::vector<double> getPosition() const override;
+        uint8_t getBaseId() const override;
         uint8_t getHopsToBaseStation() const override;
         bool getIsReturning() const override;
         void serialize(std::vector<uint8_t>& out_payload) const override;
@@ -30,6 +32,7 @@ class NeighborInfo : public NeighborInfoInterface {
 
     private:
         uint8_t neighbor_id;
+        uint8_t base_id_;        // Which base this neighbor is attached to (v1 partition).
         uint8_t hops_from_base_station;
         bool is_returning;
         std::vector<double> position;

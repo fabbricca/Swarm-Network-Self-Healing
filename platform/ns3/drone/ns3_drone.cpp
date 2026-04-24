@@ -79,6 +79,9 @@ void Ns3Drone::setBaseStation(uint8_t base_id) {
   if (m_flood_manager) {
     m_flood_manager->setBaseId(base_id);
   }
+  if (m_neighbor_manager) {
+    m_neighbor_manager->setBaseId(base_id);
+  }
 }
 
 void Ns3Drone::start() {
@@ -443,18 +446,23 @@ void Ns3Drone::handleCorePacket(const ::Packet& pkt) {
       // Payload format matches NeighborManager broadcasts:
       // [id][hops][flags][double coords...].
       if (is_direct && m_neighbor_manager) {
+        // Payload format: [neighbor_id][base_id][hops][flags][double coords...]
+        // Base presents itself with neighbor_id == base_id == ack.base_id so
+        // the NeighborManager partition filter accepts it for drones attached
+        // to the same base.
         ::Packet base_as_neighbor;
         base_as_neighbor.type = ::PacketType::NEIGHBOR;
         base_as_neighbor.src = ack.base_id;
         base_as_neighbor.dst = m_id;
 
-        base_as_neighbor.payload.resize(3 + 3 * sizeof(double));
+        base_as_neighbor.payload.resize(4 + 3 * sizeof(double));
         base_as_neighbor.payload[0] = ack.base_id;
-        base_as_neighbor.payload[1] = ack.base_hops_to_base_station;
-        base_as_neighbor.payload[2] = 0;  // flags: base is never "returning"
+        base_as_neighbor.payload[1] = ack.base_id;
+        base_as_neighbor.payload[2] = ack.base_hops_to_base_station;
+        base_as_neighbor.payload[3] = 0;  // flags: base is never "returning"
 
         const double base_coords[3] = {ack.x, ack.y, ack.z};
-        std::memcpy(base_as_neighbor.payload.data() + 3, base_coords, sizeof(base_coords));
+        std::memcpy(base_as_neighbor.payload.data() + 4, base_coords, sizeof(base_coords));
 
         m_neighbor_manager->onPacketReceived(base_as_neighbor);
       }

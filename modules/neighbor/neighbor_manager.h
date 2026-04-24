@@ -17,9 +17,16 @@ class NeighborManager : public NeighborManagerInterface {
 
   void onPacketReceived(const ::Packet& pkt) override;
   std::vector<NeighborInfoInterface*> getNeighbors() const override;
+  void setBaseId(uint8_t base_id) override;
   void sendToNeighbors(uint8_t id, PositionInterface* position, uint8_t hops_to_base_station, bool returning) override;
 
  private:
+  // v1 partition: only accept neighbors whose base_id matches ours.  Each
+  // drone is pinned to one base at construction; cross-base neighbors are
+  // discarded at deserialization so hop counts don't cross-pollinate.
+  uint8_t m_base_id = 0;
+  bool m_has_base_id = false;
+
   struct Entry {
     std::unique_ptr<NeighborInfo> info;
     uint32_t last_seen_call;

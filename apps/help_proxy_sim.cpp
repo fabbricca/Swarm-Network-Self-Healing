@@ -22,7 +22,6 @@
 #include "platform/ns3/drone/ns3_drone.h"
 #include "platform/ns3/uwb_anchor/ns3_uwb_anchor.h"
 #include "platform/ns3/uwb_channel/uwb_channel.h"
-#include "platform/ns3/uwb_channel/uwb_energy_params.h"
 
 using namespace ns3;
 
@@ -572,6 +571,7 @@ int main(int argc, char* argv[]) {
             << ", stop=" << simSeconds << "s" << std::endl;
 
   AnimationInterface anim(animOut);
+  anim.SetMobilityPollInterval(Seconds(0.05));
   anim.SetBackgroundImage("whiteBackground.png", -100, -100, 200, 200, true);
   uint32_t baseStationIcon = anim.AddResource("baseStation.png");
   uint32_t droneIcon = anim.AddResource("drone.png");
@@ -795,70 +795,6 @@ int main(int argc, char* argv[]) {
     std::cout << "Distance avg:   helper=" << (dist_helper_total / n_helper) << "m";
     if (n_lost > 0) std::cout << "  lost=" << (dist_lost_total / n_lost) << "m";
     std::cout << "\n";
-  }
-
-  // ── 4. Energy Consumption (DWM1000 estimate) ──
-  // Uses Decawave DW1000 datasheet values: 70 mA TX, 113 mA RX, 12 mA idle,
-  // 3.3 V supply, 6.8 Mbps data rate, ~160 µs frame overhead.
-  {
-    using E = sim::Dwm1000EnergyParams;
-    const auto& ch = sim::UwbChannel::Get();
-
-    std::cout << "\n── Energy Consumption (DWM1000 estimate) ──\n";
-    std::cout << std::left
-              << std::setw(8)  << "Node"
-              << std::setw(10) << "Role"
-              << std::setw(10) << "TX"
-              << std::setw(10) << "RX"
-              << std::setw(12) << "TX(J)"
-              << std::setw(12) << "RX(J)"
-              << std::setw(12) << "Idle(J)"
-              << "Total(J)\n";
-
-    double energy_base = 0.0, energy_helper = 0.0, energy_lost = 0.0, energy_anchors = 0.0;
-
-    auto printRow = [&](uint8_t id, const std::string& role) -> double {
-      const auto& es = ch.GetEnergyStats(id);
-      double tx_j = es.tx_active_s * E::TX_CURRENT_A * E::SUPPLY_VOLTAGE_V;
-      double rx_j = es.rx_active_s * E::RX_CURRENT_A * E::SUPPLY_VOLTAGE_V;
-      double idle_s = simSeconds - es.tx_active_s - es.rx_active_s;
-      if (idle_s < 0.0) idle_s = 0.0;
-      double idle_j = E::idleEnergy(idle_s);
-      double total  = tx_j + rx_j + idle_j;
-
-      std::cout << std::left
-                << std::setw(8)  << static_cast<int>(id)
-                << std::setw(10) << role
-                << std::setw(10) << es.tx_count
-                << std::setw(10) << es.rx_count
-                << std::setw(12) << tx_j
-                << std::setw(12) << rx_j
-                << std::setw(12) << idle_j
-                << total << "\n";
-      return total;
-    };
-
-    // Base station (id 0).
-    energy_base = printRow(0, "base");
-
-    // Drones 1..10.
-    for (uint32_t i = 0; i < NUM_DRONES; ++i) {
-      double e = printRow(static_cast<uint8_t>(i + 1), info[i].lost ? "lost" : "helper");
-      if (info[i].lost) energy_lost += e;
-      else              energy_helper += e;
-    }
-
-    // Anchors 11..22.
-    for (uint32_t i = 0; i < NUM_ANCHORS; ++i) {
-      energy_anchors += printRow(static_cast<uint8_t>(NUM_DRONES + 1 + i), "anchor");
-    }
-
-    double energy_all = energy_base + energy_helper + energy_lost + energy_anchors;
-    std::cout << "Energy total: base=" << energy_base << "J"
-              << "  helper=" << energy_helper << "J"
-              << "  lost=" << energy_lost << "J"
-              << "  anchors=" << energy_anchors << "J"
-              << "  all=" << energy_all << "J\n";
   }
 
   // ── 5. Return behavior (platoon-based lost-drone return) ──
@@ -1239,109 +1175,6 @@ int main(int argc, char* argv[]) {
                   << "  dead=" << bb.dead << "\n";
       }
     }
-  }
-
-  // ── 9. Per-helper midpoint convergence ──
-  // Each helper drone only hears hop-2 drones within maxRangeMeters.  Its centroid
-  // (and therefore its ideal midpoint) depends on which hop-2 drones it can see.
-  //
-  // Equilibrium-position semantics: for lost drones that completed return, we
-  // use the position captured at return-complete (where they station-keep).
-  // For helpers and non-completed drones, we use sim-end ground truth.  If no
-  // lost drone completed, the block is tagged " (no-equilibrium)".
-  auto baseMob = nodes.Get(0)->GetObject<ConstantPositionMobilityModel>();
-  Vector basePos = baseMob->GetPosition();
-
-  // Build equilibrium positions.
-  struct EqPos { uint8_t id; bool lost; uint8_t hops; Vector pos; };
-  std::vector<EqPos> eq;
-  double max_return_complete_s = -1.0;
-  uint32_t n_completed_eq = 0;
-  for (uint32_t i = 0; i < NUM_DRONES; ++i) {
-    const double done_s = drones[i]->returnCompleteTime();
-    Vector pos = info[i].gt;
-    if (done_s >= 0.0) {
-      const ::Vector3D p = drones[i]->returnCompletePosGt();
-      pos = Vector(p.x, p.y, p.z);
-      if (done_s > max_return_complete_s) max_return_complete_s = done_s;
-      ++n_completed_eq;
-    }
-    eq.push_back({info[i].id, info[i].lost, info[i].hops, pos});
-  }
-  const bool no_equilibrium = (n_completed_eq == 0);
-
-  // Collect hop-2 drones (using equilibrium positions).
-  std::vector<const EqPos*> hop2_drones;
-  for (const auto& d : eq) {
-    if (d.hops == 2) hop2_drones.push_back(&d);
-  }
-
-  // Global centroid (for reference).
-  double gcx = 0.0, gcy = 0.0, gcz = 0.0;
-  for (const auto* d : hop2_drones) { gcx += d->pos.x; gcy += d->pos.y; gcz += d->pos.z; }
-  if (!hop2_drones.empty()) {
-    double n = static_cast<double>(hop2_drones.size());
-    gcx /= n; gcy /= n; gcz /= n;
-  }
-  double gmidX = (basePos.x + gcx) / 2.0;
-  double gmidY = (basePos.y + gcy) / 2.0;
-  double gmidZ = (basePos.z + gcz) / 2.0;
-
-  std::cout << "\n── Per-Helper Midpoint Convergence ──";
-  if (no_equilibrium) std::cout << " (no-equilibrium)";
-  std::cout << "\n";
-  std::cout << "Base station: (" << basePos.x << "," << basePos.y << "," << basePos.z << ")\n";
-  if (!hop2_drones.empty()) {
-    std::cout << "Global hop-2 centroid (" << hop2_drones.size() << " drones): ("
-              << gcx << "," << gcy << "," << gcz << ")\n";
-    std::cout << "Global ideal midpoint: (" << gmidX << "," << gmidY << "," << gmidZ << ")\n";
-  }
-
-  std::cout << "\n";
-  for (const auto& h : eq) {
-    if (h.lost) continue;
-
-    // Find hop-2 drones within range of this helper (using equilibrium positions).
-    std::vector<const EqPos*> visible;
-    for (const auto* d : hop2_drones) {
-      double dx = h.pos.x - d->pos.x, dy = h.pos.y - d->pos.y, dz = h.pos.z - d->pos.z;
-      if (std::sqrt(dx*dx + dy*dy + dz*dz) <= maxRangeMeters) {
-        visible.push_back(d);
-      }
-    }
-
-    std::string hops_str = (h.hops == 0xFF) ? "?" : std::to_string(static_cast<int>(h.hops));
-    std::cout << "  helper " << static_cast<int>(h.id)
-              << " (hops=" << hops_str << ")"
-              << "  pos=(" << h.pos.x << "," << h.pos.y << "," << h.pos.z << ")\n";
-
-    if (visible.empty()) {
-      std::cout << "    sees: no hop-2 drones in range — did not start mission\n";
-      continue;
-    }
-
-    // Per-helper centroid and midpoint.
-    double lcx = 0.0, lcy = 0.0, lcz = 0.0;
-    std::cout << "    sees:";
-    for (const auto* v : visible) {
-      std::cout << " D" << static_cast<int>(v->id)
-                << "(" << v->pos.x << "," << v->pos.y << ")";
-      lcx += v->pos.x; lcy += v->pos.y; lcz += v->pos.z;
-    }
-    double vn = static_cast<double>(visible.size());
-    lcx /= vn; lcy /= vn; lcz /= vn;
-    std::cout << "\n";
-
-    double lmidX = (basePos.x + lcx) / 2.0;
-    double lmidY = (basePos.y + lcy) / 2.0;
-    double lmidZ = (basePos.z + lcz) / 2.0;
-    double dist = std::sqrt((h.pos.x-lmidX)*(h.pos.x-lmidX)
-                          + (h.pos.y-lmidY)*(h.pos.y-lmidY)
-                          + (h.pos.z-lmidZ)*(h.pos.z-lmidZ));
-
-    std::cout << "    local centroid: (" << lcx << "," << lcy << "," << lcz << ")"
-              << "  local midpoint: (" << lmidX << "," << lmidY << "," << lmidZ << ")"
-              << "  dist=" << dist << "m\n";
   }
 
   std::cout << "================================================\n" << std::endl;

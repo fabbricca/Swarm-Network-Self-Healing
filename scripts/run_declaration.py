@@ -39,9 +39,6 @@ DEFAULT_PARAMS = {
 METRIC_SPECS = [
     ("tri_avg", "Trilateration avg error (m)", 1.0),
     ("tri_max", "Trilateration max error (m)", 1.0),
-    ("helper_start_rate", "Helper start rate (%)", 100.0),
-    ("midpoint_avg", "Midpoint avg distance (m)", 1.0),
-    ("midpoint_max", "Midpoint max distance (m)", 1.0),
     ("rx_pos_update_total", "RX POS_UPDATE total", 1.0),
     ("rx_pos_ack_total", "RX POS_ACK total", 1.0),
     ("rx_help_proxy_total", "RX HELP_PROXY total", 1.0),
@@ -51,11 +48,6 @@ METRIC_SPECS = [
     ("dist_helper_total", "Distance helper total (m)", 1.0),
     ("dist_lost_total", "Distance lost total (m)", 1.0),
     ("dist_all_total", "Distance all total (m)", 1.0),
-    ("energy_base_j", "Energy base (J)", 1.0),
-    ("energy_helper_j", "Energy helper (J)", 1.0),
-    ("energy_lost_j", "Energy lost (J)", 1.0),
-    ("energy_anchors_j", "Energy anchors (J)", 1.0),
-    ("energy_all_j", "Energy all (J)", 1.0),
     ("healing_avg_s", "Healing latency avg (s)", 1.0),
     ("healing_p95_s", "Healing latency p95 (s)", 1.0),
     ("healing_max_s", "Healing latency max (s)", 1.0),
@@ -111,13 +103,6 @@ TRI_RE = re.compile(
     r"Trilateration:\s*min=([\d.eE+-]+)m\s+max=([\d.eE+-]+)m\s+avg=([\d.eE+-]+)m"
 )
 
-HELPER_RE = re.compile(
-    r"helper\s+(\d+)\s*\(hops=[^)]+\)\s*pos=\([^)]+\)\n"
-    r"(?:\s*sees:\s*no hop-2 drones[^\n]*\n"
-    r"|\s*sees:[^\n]*\n\s*local centroid:[^\n]*dist=([\d.eE+-]+)m\n)",
-    re.MULTILINE,
-)
-
 PACKET_ROW_RE = re.compile(
     r"^\s*(\d+)\s+(helper|lost)\s+\S+\s+"
     r"(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s*$",
@@ -126,11 +111,6 @@ PACKET_ROW_RE = re.compile(
 
 DISTANCE_TOTAL_RE = re.compile(
     r"Distance total:\s*helper=([\d.eE+-]+)m\s+lost=([\d.eE+-]+)m\s+all=([\d.eE+-]+)m"
-)
-
-ENERGY_TOTAL_RE = re.compile(
-    r"Energy total:\s*base=([\d.eE+-]+)J\s+helper=([\d.eE+-]+)J\s+"
-    r"lost=([\d.eE+-]+)J\s+anchors=([\d.eE+-]+)J\s+all=([\d.eE+-]+)J"
 )
 
 # Stats-bearing lines collapse to just `drones=N` when N=0 (no avg/p95/max).
@@ -761,18 +741,6 @@ def parse_metrics(output: str) -> dict[str, float | int | None]:
         metrics["tri_max"] = None
         metrics["tri_avg"] = None
 
-    helper_distances: list[float | None] = []
-    for match in HELPER_RE.finditer(output):
-        dist = match.group(2)
-        helper_distances.append(float(dist) if dist else None)
-
-    started = [d for d in helper_distances if d is not None]
-    metrics["helpers_total"] = len(helper_distances)
-    metrics["helpers_started"] = len(started)
-    metrics["helper_start_rate"] = (len(started) / len(helper_distances)) if helper_distances else None
-    metrics["midpoint_avg"] = statistics.mean(started) if started else None
-    metrics["midpoint_max"] = max(started) if started else None
-
     packet_rows = PACKET_ROW_RE.findall(output)
     if packet_rows:
         pu = pa = hp = fl = ne = ub = 0
@@ -799,20 +767,6 @@ def parse_metrics(output: str) -> dict[str, float | int | None]:
         metrics["dist_helper_total"] = None
         metrics["dist_lost_total"] = None
         metrics["dist_all_total"] = None
-
-    energy = ENERGY_TOTAL_RE.search(output)
-    if energy:
-        metrics["energy_base_j"] = float(energy.group(1))
-        metrics["energy_helper_j"] = float(energy.group(2))
-        metrics["energy_lost_j"] = float(energy.group(3))
-        metrics["energy_anchors_j"] = float(energy.group(4))
-        metrics["energy_all_j"] = float(energy.group(5))
-    else:
-        metrics["energy_base_j"] = None
-        metrics["energy_helper_j"] = None
-        metrics["energy_lost_j"] = None
-        metrics["energy_anchors_j"] = None
-        metrics["energy_all_j"] = None
 
     # ── Healing outcome / return quality / post-return stability ──
     healing = HEALING_RE.search(output)

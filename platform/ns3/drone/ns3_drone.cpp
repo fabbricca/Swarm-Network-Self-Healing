@@ -384,12 +384,19 @@ void Ns3Drone::handleCorePacket(const ::Packet& pkt) {
 
       if (is_direct) {
         st.last_direct_ack_rx_s = now_s;
-        // v2: a direct ACK is unambiguous proof of current reachability, so
-        // it always refreshes last_ack_rx_s -- even after help_proxy_sent
-        // latched.  A returning drone that reaches the coverage boundary
-        // needs this to register as "hop=1 to base" in end-of-sim metrics
-        // and to unlock station-keeping re-arm logic.
-        st.last_ack_rx_s = now_s;
+        // Do NOT refresh last_ack_rx_s here after help_proxy_sent is
+        // latched.  Letting it stay frozen is what allows
+        // FloodManager::getHopsFromBase() to fall through to flood-derived
+        // hops + stale-protection (return UINT8_MAX when flood_hop==1 and
+        // !is_base_reachable), which is what makes a returned, station-
+        // keeping drone advertise itself as an outward "anchor at the
+        // boundary" rather than a hop=1 peer.  Without that distinction,
+        // helpers (also at hop=1) see station-keeping drones as same-hop
+        // peers and skip them in centroid/weighted attraction, collapsing
+        // the formation onto the base.  The !help_proxy_sent branch below
+        // still refreshes last_ack_rx_s for the normal pre-loss path; the
+        // station-keeping re-arm logic uses last_direct_ack_rx_s, so that
+        // remains intact.
       }
 
       if (help_proxy_sent && m_first_ack_after_help_s < 0.0) {

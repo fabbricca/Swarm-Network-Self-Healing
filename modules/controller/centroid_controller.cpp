@@ -15,17 +15,26 @@ void CentroidController::accumulateAttractive(
     // avoidance for them is handled in ControllerBase::step.
     //
     // v2 multi-base: query each neighbor's hop count relative to the base
-    // WE (self) are optimizing against.  Neighbors attached to a different
-    // base return UINT8_MAX and are naturally excluded.  If we have no
-    // nearest base (UINT8_MAX), fall back to getMinHopsToAnyBase so the
-    // drone can still form up around whatever chain exists.
+    // WE (self) are optimizing against.  If we have no nearest base
+    // (UINT8_MAX), fall back to getMinHopsToAnyBase so the drone can still
+    // form up around whatever chain exists.
+    //
+    // A neighbor with no path to OUR base needs care: if it has a path to
+    // some other base, it belongs to that base's swarm and we skip it
+    // (multi-base partition).  If it has no path to ANY base, it is
+    // genuinely lost — bucket it under a sentinel hop above self_hops so it
+    // acts as an outward attractor (matches pre-multi-base behavior, which
+    // is what creates the helper-stays-at-midpoint equilibrium).
     std::unordered_map<uint8_t, std::vector<std::vector<double>>> hop_groups;
     for (const NeighborInfoInterface* neighbor : neighbors) {
         if (neighbor->getIsReturning()) continue;
-        const uint8_t nh = (self_base_id == UINT8_MAX)
+        uint8_t nh = (self_base_id == UINT8_MAX)
             ? neighbor->getMinHopsToAnyBase()
             : neighbor->getHopsToBase(self_base_id);
-        if (nh == UINT8_MAX) continue;
+        if (nh == UINT8_MAX) {
+            if (neighbor->getMinHopsToAnyBase() != UINT8_MAX) continue;
+            nh = UINT8_MAX;  // genuinely lost — sentinel "higher than any real hop"
+        }
         if (nh != self_hops) {
             hop_groups[nh].push_back(neighbor->getPosition());
         }

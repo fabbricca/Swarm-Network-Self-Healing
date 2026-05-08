@@ -95,47 +95,73 @@ Stale anchor measurements (>0.5s without a beacon) are automatically expired, so
 
 ### Formation Control
 
-The controller uses a virtual spring-damper model with two force components:
+The controller uses a virtual spring-damper model combining linear attraction to neighbors at adjacent hop levels with 1/d² short-range repulsion:
 
-**Attractive Forces** (toward relay neighbors):
+**Net Force:**
 ```
-F_att = K_att × (p_neighbor - p_self)   for neighbors with different hop counts
-```
-
-**Repulsive Forces** (collision avoidance):
-```
-F_rep = K_rep × (1/dist²) × unit_vector   when dist < D_safe
+F_tot = Σ K_att(p_j - p_i)  [j ∈ neighbors at hop h±1]
+      - Σ (K_rep/d_ij²) × (p_j - p_i)/d_ij  [j ∈ neighbors, d_ij < D_safe]
 ```
 
-This drives drones toward the geometric midpoint between their preceding and following neighbors in the relay chain, maximizing SNR for both links.
+The attractive term drives drones toward the geometric midpoint between their preceding and following neighbors in the relay chain, maximizing SNR on both links. Repulsion applies to all neighbors, including peers at the same hop count.
+
+**Acceleration** is computed via Newton's second law:
+```
+a = F_tot / m
+```
+
+This is then integrated into velocity and position updates using the kinematic mobility model.
 
 ### Key Parameters
 
-| Parameter | Symbol | Description | Default |
-|-----------|--------|-------------|---------|
+| Parameter | Symbol | Description | Baseline |
+|-----------|--------|-------------|----------|
 | Coverage radius | R_max | UWB communication range | 50 m |
-| Attractive gain | K_att | Spring constant for attraction | 1.0 |
+| Coverage area |  | Topology | Circular, centered at base station |
+| Attractive gain | K_att | Spring constant for attraction | 0.3 |
 | Repulsive gain | K_rep | Repulsion strength | 8.0 |
 | Safety distance | D_safe | Minimum separation threshold | 2.0 m |
 | Max velocity | V_max | Drone speed limit | 1.0 m/s |
-| Drone mass | m | Based on Crazyflie 2.1 | 29 g |
+| Drone mass | m | Based on Crazyflie 2.1 | 29 g (0.029 kg) |
+| Control tick interval | T_ctrl | Position update period | 0.05 s |
+| Number of drones | N_d | Baseline swarm size | 20 |
+| Number of anchors | N_a | Standalone UWB anchors | 18 |
 
 ## Simulation
 
 The simulation runs in **NS-3** (Network Simulator 3) with:
 - UWB PHY-layer channel with propagation delay modeled as `distance / speed_of_light`
-- Range-based cutoff (default 50m)
+- Range-based cutoff (default 50 m)
 - No MAC layer — direct PHY delivery with nanosecond timing resolution
-- Custom kinematic mobility model
 - UWB anchor infrastructure for drone trilateration
 
-### Default Scenario
+### Kinematic Mobility Model
 
-- 1 base station at origin (0, 0, 0) — also acts as UWB anchor
-- 3 drones at (40, 15, 0), (70, 10, 0), and (30, 25, 0)
-- 5 standalone UWB anchors for trilateration coverage
-- Drone 2 starts outside coverage (>50m) and triggers self-healing
-- End-of-simulation metrics: trilateration error, midpoint convergence
+Drones use a lightweight kinematic model that integrates commanded accelerations under standard Newtonian mechanics:
+
+```
+p_new = p_old + v_old × Δt + ½a × Δt²
+v_new = v_old + a × Δt
+```
+
+where:
+- `p` and `v` are position and velocity vectors
+- `a` is the acceleration computed from the spring-damper controller
+- `Δt = 0.05 s` is the control tick interval
+- Velocity magnitude is capped at `V_max` (default 1.0 m/s)
+
+This model focuses on network-driven coordination by abstracting away aerodynamic complexity; it does not account for multipath or drag effects.
+
+### Baseline Evaluation Scenario
+
+- **1 base station** at origin (0, 0, 0) — also acts as UWB anchor
+- **20 drones** positioned in three zones:
+  - 6 helpers on a ~40 m ring just inside the 50 m coverage radius
+  - 11 drones in the 68–82 m belt just outside coverage
+  - 3 far scouts at 112–118 m to force multi-hop relay chain
+- **18 standalone UWB anchors** guaranteeing at least 3 line-of-sight beacons everywhere
+- **Evaluation**: 15 scenarios covering different topologies, swarm densities, anchor configurations, ranging noise, and scheduled drone failures
+- **Metrics**: Trilateration error, healing latency, return latency, recovery rate, final coverage, and station-keeping drift
 
 ## Building and Running
 
@@ -229,14 +255,17 @@ To visualize the simulation, use the **NetAnim** tool included in NS-3:
 
 ## Results
 
-With default parameters and UWB trilateration, the system achieves:
+Across 15 single-base evaluation scenarios (30 total runs—15 per controller variant), the system achieves:
 
-| Metric | Value |
-|--------|-------|
-| Trilateration error (avg) | ~13 cm |
-| Trilateration error (max) | ~24 cm |
-| Midpoint convergence | < 1 m |
-| Connection restoration time | ~1.5 s |
+| Metric | Centroid | Weighted |
+|--------|----------|----------|
+| Trilateration error (avg) | 0.47 ± 0.25 m | 0.43 ± 0.23 m |
+| Healing latency | 0.92 ± 0.11 s | 0.92 ± 0.10 s |
+| Return latency | 23.24 ± 12.04 s | 21.36 ± 6.19 s |
+| Recovery rate | 85.24 ± 28.11 % | 83.84 ± 33.24 % |
+| Final coverage | 98.63 ± 3.61 % | 98.63 ± 3.61 % |
+
+The weighted controller variant reduces mean return latency by **8%** and the p₉₅ tail by **21%** compared to centroid, while healing latency remains identical across both variants. Both variants restore connectivity within ~1 second in every scenario.
 
 ## Authors
 

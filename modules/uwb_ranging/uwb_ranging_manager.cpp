@@ -69,6 +69,13 @@ std::vector<double> UwbRangingManager::getEstimatedPosition() const {
   return {m_est_x, m_est_y, m_est_z};
 }
 
+void UwbRangingManager::seedEstimatedPosition(double x, double y, double z) {
+  m_est_x = x;
+  m_est_y = y;
+  m_est_z = z;
+  m_has_position = true;
+}
+
 // Linearized least-squares trilateration.
 //
 // Given N anchors at known positions (xi, yi, zi) with measured ranges ri,
@@ -103,17 +110,27 @@ bool UwbRangingManager::trilaterate() {
   const double r1_sq = a0.range_m * a0.range_m;
   const double k1 = x1 * x1 + y1 * y1 + z1 * z1;
 
-  // Check whether anchors span 3D (non-zero z spread) or are coplanar.
-  // If coplanar (z=0), solve 2D only — adding a z column would make A^T A singular.
-  // With >3 coplanar anchors, the overdetermined 2D system gives better accuracy.
-  bool has_z_spread = false;
+  // Decide between 2D and 3D solve based on anchor z diversity.
+  //
+  // The old heuristic (any anchor_z differing by >1e-6 from the first) is a
+  // numerical-singularity test, not a GDOP test.  A handful of ground-level
+  // anchors with z ∈ [2, 5] m is geometrically coplanar from a drone flying
+  // at ~20 m altitude: range errors amplify 10× in z and the solver returns
+  // garbage.  That garbage then feeds the controller, which drives drones up
+  // or down chasing phantom altitudes until they leave anchor coverage and
+  // the trilat freezes at a nonsensical value.
+  //
+  // Require meaningful vertical diversity before attempting 3D.  Below this
+  // threshold we fall back to 2D and preserve the previous m_est_z so the
+  // controller sees a stable altitude instead of an oscillating one.
+  double z_min = z1;
+  double z_max = z1;
   for (size_t i = 1; i < n; ++i) {
-    if (std::abs(anchors[i].anchor_z - z1) > 1e-6) {
-      has_z_spread = true;
-      break;
-    }
+    if (anchors[i].anchor_z < z_min) z_min = anchors[i].anchor_z;
+    if (anchors[i].anchor_z > z_max) z_max = anchors[i].anchor_z;
   }
-  const bool solve_3d = has_z_spread && (n >= 4);
+  const double z_spread = z_max - z_min;
+  const bool solve_3d = (z_spread >= Z_SPREAD_MIN_FOR_3D_M) && (n >= 4);
   const size_t cols = solve_3d ? 3 : 2;
   const size_t rows = n - 1;
 
@@ -167,7 +184,10 @@ bool UwbRangingManager::trilaterate() {
     }
     m_est_x = (ATb[0] * ATA[3] - ATb[1] * ATA[1]) / det;
     m_est_y = (ATA[0] * ATb[1] - ATA[2] * ATb[0]) / det;
-    m_est_z = 0.0;
+    // Preserve the previous z.  In 2D mode we have no information about
+    // altitude from ranging alone, so resetting to 0 every tick would
+    // artificially snap the reported altitude down and inject a z-step into
+    // any controller using distanceFromCoords().
   } else {
     // 3x3 Cramer's rule.
     auto det3 = [](double a00, double a01, double a02,

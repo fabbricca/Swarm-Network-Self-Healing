@@ -8,6 +8,7 @@ enum class SimMsgType : uint8_t {
     POS_UPDATE = 0x80,
     POS_ACK = 0x81,
     HELP_PROXY = 0x82,
+    RETURNING  = 0x83,
 };
 
 #pragma pack(push, 1)
@@ -43,6 +44,12 @@ struct HelpProxyMsg {
     uint8_t base_id;
 };
 
+struct ReturningMsg {
+    SimMsgType type = SimMsgType::RETURNING;
+    uint8_t drone_id;       // who is returning
+    uint8_t hop_count;      // sender's hop count (receiver checks it's downstream)
+};
+
 // UWB beacon broadcast by anchors at a fixed rate.
 // Drones use the timestamp + known propagation speed to compute
 // ToF-based range for trilateration.
@@ -57,6 +64,7 @@ struct UwbBeaconMsg {
 #pragma pack(pop)
 
 static_assert(sizeof(HelpProxyMsg) == 3, "HelpProxyMsg must be packed");
+static_assert(sizeof(ReturningMsg) == 3, "ReturningMsg must be packed");
 static_assert(sizeof(PositionUpdateMsg) == 17, "PositionUpdateMsg must be packed");
 static_assert(sizeof(PositionAckMsg) == 30, "PositionAckMsg must be packed");
 static_assert(sizeof(UwbBeaconMsg) == 33, "UwbBeaconMsg must be packed");

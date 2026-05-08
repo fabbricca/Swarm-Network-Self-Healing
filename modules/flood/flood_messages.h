@@ -22,6 +22,7 @@ struct FloodStartMsg {
 
 struct FloodDiscoveryMsg {
     FloodMsgType type = FloodMsgType::DISCOVERY;
+    uint8_t base_id;         // Which base originated this flood (v1 partition).
     uint16_t flood_id;
     uint8_t initiator_id;
     uint8_t hop_to_base;
@@ -30,6 +31,7 @@ struct FloodDiscoveryMsg {
 // Swarm broadcast: report best hop to base
 struct FloodReportMsg {
     FloodMsgType type = FloodMsgType::REPORT;
+    uint8_t base_id;         // Which base this report pertains to.
     uint16_t flood_id;
     uint8_t initiator_id;
     uint8_t reporter_id;
@@ -39,5 +41,5 @@ struct FloodReportMsg {
 #pragma pack(pop)
 
 static_assert(sizeof(FloodStartMsg) == 3, "FloodStartMsg must be packed");
-static_assert(sizeof(FloodDiscoveryMsg) == 5, "FloodDiscoveryMsg must be packed");
-static_assert(sizeof(FloodReportMsg) == 6, "FloodReportMsg must be packed");
+static_assert(sizeof(FloodDiscoveryMsg) == 6, "FloodDiscoveryMsg must be packed");
+static_assert(sizeof(FloodReportMsg) == 7, "FloodReportMsg must be packed");

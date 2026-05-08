@@ -31,8 +31,7 @@ The architecture is designed around three node types:
 
 ```
 ├── apps/                          # Executable applications
-│   ├── help_proxy_sim.cpp         # Main simulation scenario
-│   └── controller_tuner.cpp       # Parameter tuning grid search
+│   └── help_proxy_sim.cpp         # Main simulation scenario
 ├── common/                        # Shared data structures
 │   ├── messages.h                 # Protocol message definitions (incl. UwbBeaconMsg)
 │   ├── packet.h                   # Packet envelope format
@@ -165,23 +164,61 @@ docker run --rm swarm-sim sim \
   --animOut=/project/output/drone-simulation.xml
 ```
 
-### Parameter Tuner
+### Scenario overrides
 
-Run the grid search tuner to optimize controller parameters:
-
-```bash
-docker run --rm swarm-sim tuner
-```
-
-Tuner options:
+Base station, drone, and anchor positions can be overridden per-run via a
+plain-text file:
 
 ```bash
-docker run --rm swarm-sim tuner \
-  --kAttMin=0.5 --kAttMax=2.0 --kAttStep=0.5 \
-  --kRepMin=4.0 --kRepMax=12.0 --kRepStep=2.0 \
-  --dSafeMin=1.0 --dSafeMax=3.0 --dSafeStep=0.5 \
-  --simSeconds=150.0
+docker run --rm \
+  -v /path/to/scenario.txt:/tmp/scenario.txt:ro \
+  -v $(pwd)/output:/output \
+  swarm-sim sim --scenarioFile=/tmp/scenario.txt
 ```
+
+The file format is line-oriented (`#` comments allowed); any subset of keys
+may be overridden, others keep their compiled-in defaults:
+
+```
+base=0,0,0
+drone1=35.0,20.0,0.0
+drone4=70.0,25.0,0.0
+anchor5=65.0,0.0,0.0
+```
+
+Unknown keys error out so typos can't silently no-op.
+
+### Batch runs
+
+`scripts/run_declaration.py` runs a batch of simulations declared in a JSON
+file and reports per-metric averages across all runs:
+
+```bash
+python3 scripts/run_declaration.py scripts/simulations/declaration.json \
+  --algorithm=centroid --timeout=600
+```
+
+Each declared scenario layers its own overrides on top of shared defaults; the
+runner writes per-run artefacts under `output/decl_run_<timestamp>/runs/*/`
+and aggregate summaries (`aggregate.json`, `aggregate.md`) at the top level.
+Pass `--algorithm=weighted` to rerun the same declaration against the other
+formation controller.
+
+### Formation Control Algorithm
+
+Select the formation-control strategy with `--algorithm` (default: `centroid`):
+
+```bash
+docker run --rm swarm-sim sim --algorithm=centroid   # hop-group centroid
+docker run --rm swarm-sim sim --algorithm=weighted   # count-weighted per-neighbor
+```
+
+- `centroid` — neighbors at the same hop count contribute a single attractive
+  force toward their centroid. N drones at one hop pull as a single virtual
+  drone, so the equilibrium sits on the midpoint between sides.
+- `weighted` — each attraction to a lower-hop neighbor is scaled by the number
+  of higher-hop neighbors and vice versa. The Σw·(p−s)=0 solution places the
+  equilibrium exactly at (centroid_low + centroid_high)/2.
 
 ## Visualization
 
@@ -203,7 +240,6 @@ With default parameters and UWB trilateration, the system achieves:
 
 ## Authors
 
-- Gianluca Bresolin (University of Padua)
 - Riccardo Fabbian (University of Padua)
 
 ### Supervisor

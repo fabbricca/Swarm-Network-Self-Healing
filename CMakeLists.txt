@@ -8,7 +8,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 add_executable(swarm_demo_sim1
 	apps/help_proxy_sim.cpp
 	platform/ns3/base_station/ns3_base_station.cpp
-	modules/controller/controller.cpp
+	modules/controller/controller_base.cpp
+	modules/controller/centroid_controller.cpp
+	modules/controller/weighted_controller.cpp
+	modules/controller/controller_factory.cpp
 	modules/communication/communication_manager.cpp
 	modules/dispatch/dispatch_manager.cpp
 	platform/ns3/drone/ns3_drone.cpp
@@ -22,10 +25,6 @@ add_executable(swarm_demo_sim1
 	platform/ns3/uwb_anchor/ns3_uwb_anchor.cpp
 	platform/ns3/uwb_channel/uwb_channel.cpp
 	platform/ns3/uwb_transport/uwb_transport.cpp
-)
-
-add_executable(controller_tuner
-	apps/controller_tuner.cpp
 )
 
 target_include_directories(swarm_demo_sim1 PRIVATE

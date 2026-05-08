@@ -29,6 +29,13 @@ class Ns3BaseStation : public Ns3UwbAnchor {
   // Trigger a new flood by unicast start to an initiator drone.
   void requestFlood(uint16_t flood_id, uint8_t initiator_drone_id);
 
+  // One-shot mid-sim kill: stops POS_ACK responses and floods.  Drones
+  // relying on this base stop getting ACKs and (in v2) migrate to the
+  // next-nearest reachable base.  Mirrors Ns3Drone::kill().
+  void   kill();
+  bool   isAlive() const { return m_alive; }
+  double killedAtS() const { return m_killed_at_s; }
+
  private:
   void onTick();
 
@@ -44,6 +51,13 @@ class Ns3BaseStation : public Ns3UwbAnchor {
   std::unordered_map<uint8_t, bool> m_drone_ids;
   std::unordered_map<uint8_t, PositionUpdateMsg> m_last_position;
 
-  double m_tick_dt_s = 0.05;
+  bool   m_alive = true;
+  double m_killed_at_s = -1.0;
+
+  // Flood interval: each tick the base seeds a new flood that propagates
+  // through the swarm.  At 50 ms this was the single biggest source of radio
+  // traffic; 2.5 s still refreshes hop counts faster than the swarm reshapes
+  // in our scenarios (topology is effectively static after t≈2 s).
+  double m_tick_dt_s = 2.5;
   uint16_t m_flood_seq = 0;
 };

@@ -329,7 +329,14 @@ void Ns3Drone::dispatchPacket(const ::Packet& pkt) {
   // Use it to bootstrap last_ack_rx_s so isBaseReachable() can return true
   // before the first real POS_ACK arrives, breaking the chicken-and-egg
   // between "pick nearest base" and "send POS_UPDATE to get an ACK".
-  if (pkt.type == ::PacketType::FLOOD) {
+  //
+  // Skip the bootstrap once we have latched help_proxy_sent.  After that
+  // point we deliberately keep last_ack_rx_s frozen so a returned, station-
+  // keeping drone keeps reporting flood-derived hops=2 (rather than seeding
+  // a hop=1 flood and tripping the stale-protection branch).  Direct ACKs
+  // still update last_direct_ack_rx_s, which is what the station-keeping
+  // re-arm logic and end-of-sim direct-coverage detection consult.
+  if (pkt.type == ::PacketType::FLOOD && !help_proxy_sent) {
     auto it = m_base_state.find(pkt.src);
     if (it != m_base_state.end()) {
       it->second.last_ack_rx_s = ::ns3::Simulator::Now().GetSeconds();

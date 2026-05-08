@@ -164,10 +164,23 @@ void FloodManager::startFlood(uint16_t flood_id) {
 }
 
 void FloodManager::handleStart(const FloodStartMsg& msg) {
-    // Base -> initiator drone.  self_base_id is set by Ns3Drone::registerBase
-    // via a START path NOT implemented here -- drones receive START from a
-    // base via pkt.src; we pick that as the originating base.  For base-side
-    // FloodManagers, self_base_id is set explicitly.
+    // Base -> initiator drone.  self_base_id is set by the START path
+    // above (drones receive START from the base, pkt.src is the base id).
+    //
+    // Only "fully in-coverage" drones should re-initiate the flood.  In
+    // particular, a station-keeping drone that has previously sent
+    // HELP_PROXY hears every base's broadcast START because it is back in
+    // radio range, but its last_ack_rx_s is intentionally frozen so the
+    // controller still treats it as a returned-anchor (hops=2 in NEIGHBOR
+    // broadcasts) -- if we let it re-seed the flood with hop_to_base=1,
+    // the stale-protection branch in getHopsFromBase() then collapses its
+    // reported hops to UINT8_MAX, breaking both the formation outward
+    // attraction and the end-of-sim coverage metrics.  Skip the initiate
+    // for those drones; the genuinely-coverage helpers (last_ack_rx_s
+    // fresh) will seed instead.
+    if (is_base_reachable && !is_base_reachable(self_base_id)) {
+        return;
+    }
     auto& pb = per_base[self_base_id];
     if (pb.seen_floods.count(msg.flood_id)) {
         return;
